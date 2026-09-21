@@ -1,0 +1,50 @@
+name: Build apps
+
+# PyInstaller cannot cross-compile, so each platform is built on its own runner.
+# Run from the Actions tab ("Run workflow") or push a tag like v1.0.0.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: Windows
+          - os: macos-14        # Apple Silicon (M1/M2/M3/M4)
+            name: macOS-AppleSilicon
+          - os: macos-13        # Intel Macs
+            name: macOS-Intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+      - name: Run tests
+        run: python -m unittest discover tests
+      - name: Build app
+        shell: bash
+        run: python build_app.py --node "$(node -p 'process.execPath')"
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/SkeletonBuilder -DestinationPath "SkeletonBuilder-${{ matrix.name }}.zip"
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent "dist/Premiere Skeleton Builder.app" "SkeletonBuilder-${{ matrix.name }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SkeletonBuilder-${{ matrix.name }}
+          path: SkeletonBuilder-${{ matrix.name }}.zip

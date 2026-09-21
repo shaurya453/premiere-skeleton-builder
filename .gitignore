@@ -1,0 +1,27 @@
+.venv/
+.cache/
+output/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+.env
+.env.*
+!.env.example
+inputs/
+*.mp3
+*.mp4
+*.wav
+*.docx
+*.pdf
+
+# Machine-specific setup and generated Mac launcher
+*.app/
+LOCAL-SETUP.md
+DEVELOPMENT-NOTES.md
+
+# Build output
+dist/
+build/
+*.spec
+startup_err.log

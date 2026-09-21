@@ -1,0 +1,513 @@
+"""Desktop interface for persistent, detached local builds."""
+from __future__ import annotations
+
+import datetime
+import glob
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import traceback
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+try:
+    from tkinterdnd2 import DND_FILES, TkinterDnD
+except Exception:  # drag and drop is optional
+    DND_FILES = TkinterDnD = None
+
+from jobs import ROOT, SETTINGS, DEFAULT_PROJECTS, DEFAULT_MEDIA, DEFAULT_MODELS, read_json, write_json, runs, start_job, projects_dir
+from skeleton_builder import inspect_docx
+from google_docs import is_google_doc_url, download_google_doc
+from drive_audio import is_drive_url
+
+PRESETS = {
+    "YouTube 1080p Standard (16:9 @ 29.97 fps)": {"width": 1920, "height": 1080, "limit": 90, "handles": 10},
+    "YouTube 4K Ultra HD (16:9 @ 29.97 fps)": {"width": 3840, "height": 2160, "limit": 90, "handles": 10},
+    "YouTube Shorts / TikTok (9:16 Vertical)": {"width": 1080, "height": 1920, "limit": 30, "handles": 5},
+    "Cinematic Longform (16:9 @ 24 fps)": {"width": 1920, "height": 1080, "limit": 120, "handles": 15},
+}
+WHISPER_MODELS = ["small.en", "medium.en", "large-v3-turbo", "distil-large-v3"]
+UI_FONT = "Segoe UI" if os.name == "nt" else ("Helvetica Neue" if sys.platform == "darwin" else "DejaVu Sans")
+AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".mp4", ".mov"}
+
+BG, PANEL, FIELD, FG, MUTED, ACCENT, BORDER = "#16181d", "#1e2128", "#262a33", "#e6e8ec", "#9aa1ad", "#4c8dff", "#333846"
+
+
+def apply_dark_theme(window):
+    style = ttk.Style(window)
+    style.theme_use("clam")
+    window.configure(bg=BG)
+    style.configure(".", background=BG, foreground=FG, fieldbackground=FIELD, bordercolor=BORDER,
+                    lightcolor=BORDER, darkcolor=BORDER, troughcolor=PANEL, focuscolor=ACCENT, insertcolor=FG)
+    style.configure("TLabelframe", background=BG, bordercolor=BORDER)
+    style.configure("TLabelframe.Label", background=BG, foreground=ACCENT)
+    style.configure("TButton", background=FIELD, foreground=FG, bordercolor=BORDER, padding=(8, 4))
+    style.map("TButton", background=[("active", "#323846"), ("disabled", PANEL)], foreground=[("disabled", MUTED)])
+    style.configure("TEntry", fieldbackground=FIELD, foreground=FG, insertcolor=FG)
+    style.configure("TCombobox", fieldbackground=FIELD, background=FIELD, foreground=FG, arrowcolor=FG)
+    style.map("TCombobox", fieldbackground=[("readonly", FIELD)], foreground=[("readonly", FG)],
+              selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", FG)])
+    style.configure("TCheckbutton", background=BG, foreground=FG, indicatorcolor=FIELD)
+    style.map("TCheckbutton", background=[("active", BG)], indicatorcolor=[("selected", ACCENT)])
+    style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=FG, bordercolor=BORDER)
+    style.configure("Treeview.Heading", background=FIELD, foreground=FG, bordercolor=BORDER)
+    style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#ffffff")])
+    style.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor=PANEL, bordercolor=BORDER)
+    style.configure("TNotebook", background=BG, borderwidth=0)
+    style.configure("TNotebook.Tab", background=PANEL, foreground=MUTED, padding=(10, 6), borderwidth=0)
+    style.map("TNotebook.Tab", background=[("selected", FIELD)], foreground=[("selected", FG)])
+    window.option_add("*TCombobox*Listbox.background", FIELD)
+    window.option_add("*TCombobox*Listbox.foreground", FG)
+    window.option_add("*TCombobox*Listbox.selectBackground", ACCENT)
+    window.option_add("*TCombobox*Listbox.selectForeground", "#ffffff")
+    if os.name == "nt":  # dark title bar
+        try:
+            import ctypes
+            window.update()
+            hwnd = ctypes.windll.user32.GetParent(window.winfo_id())
+            for attr in (20, 19):
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(ctypes.c_int(1)), 4)
+        except Exception:
+            pass
+
+
+def find_premiere():
+    """Best-guess Premiere Pro program on this computer."""
+    if os.name == "nt":
+        hits = glob.glob(r"C:\Program Files\Adobe\Adobe Premiere Pro*\Adobe Premiere Pro.exe")
+    elif sys.platform == "darwin":
+        hits = glob.glob("/Applications/Adobe Premiere Pro*/Adobe Premiere Pro*.app")
+    else:
+        hits = []
+    return sorted(hits)[-1] if hits else ""
+
+
+def skeleton_xml(run):
+    """Skeleton_full.xml of a run record from jobs.runs(), if it has been built."""
+    xml = Path(run["result"]) / "Skeleton_full.xml" if run else None
+    return xml if xml and xml.exists() else None
+
+
+def main(smoke_test: bool = False):
+    window = TkinterDnD.Tk() if TkinterDnD else tk.Tk()
+    if smoke_test:
+        window.withdraw()
+    window.title("Premiere Pro Skeleton Builder")
+    window.geometry("900x720")
+    window.minsize(820, 640)
+    window.configure(padx=16, pady=12)
+    apply_dark_theme(window)
+    if not smoke_test:
+        window.lift()
+        window.attributes("-topmost", True)
+        window.after(300, lambda: window.attributes("-topmost", False))
+        window.focus_force()
+
+    saved = read_json(SETTINGS)
+    selected = [None]
+    known = {}
+    last_log = [None]
+    notified_runs = set()
+
+    ttk.Label(window, text="Premiere Pro Skeleton Builder", font=(UI_FONT, 17, "bold")).pack(anchor="w")
+    ttk.Label(window, text="Script + voiceover in, editable Premiere timeline out. Builds keep running if you close this window.",
+              foreground=MUTED).pack(anchor="w", pady=(0, 8))
+
+    tabs = ttk.Notebook(window)
+    tabs.pack(fill="both", expand=True)
+    build_tab = ttk.Frame(tabs, padding=14)
+    runs_tab = ttk.Frame(tabs, padding=14)
+    paths_tab = ttk.Frame(tabs, padding=14)
+    tabs.add(build_tab, text="  Build  ")
+    tabs.add(runs_tab, text="  Runs  ")
+    tabs.add(paths_tab, text="  Paths & Options  ")
+
+    # ---------------- Paths & Options tab (settings live here) ----------------
+    settings_vars = {
+        "projects_dir": tk.StringVar(value=saved.get("projects_dir") or str(DEFAULT_PROJECTS)),
+        "media_dir": tk.StringVar(value=saved.get("media_dir") or str(DEFAULT_MEDIA)),
+        "models_dir": tk.StringVar(value=saved.get("models_dir") or str(DEFAULT_MODELS)),
+        "premiere_exe": tk.StringVar(value=saved.get("premiere_exe") or find_premiere()),
+        "videos": tk.BooleanVar(value=saved.get("videos", True)),
+        "limit_minutes": tk.StringVar(value=str(saved.get("limit_minutes", 90))),
+        "buffer_minutes": tk.StringVar(value=str(saved.get("buffer_minutes", 10))),
+        "width": tk.StringVar(value=str(saved.get("width", 1920))),
+        "height": tk.StringVar(value=str(saved.get("height", 1080))),
+        "whisper_model": tk.StringVar(value=saved.get("whisper_model", "small.en")),
+        "device": tk.StringVar(value=saved.get("device", "auto")),
+        "preset": tk.StringVar(value=saved.get("preset", list(PRESETS)[0])),
+    }
+
+    def save_settings(*_):
+        write_json(SETTINGS, {k: v.get() for k, v in settings_vars.items()})
+
+    for var in settings_vars.values():
+        var.trace_add("write", save_settings)
+    for key in ("projects_dir", "media_dir", "models_dir"):  # make sure the default locations exist
+        try:
+            Path(settings_vars[key].get()).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    save_settings()
+
+    def pick_folder(var, title):
+        def choose_folder():
+            path = filedialog.askdirectory(title=title, initialdir=var.get() or str(ROOT))
+            if path:
+                var.set(path)
+        return choose_folder
+
+    def pick_program():
+        path = filedialog.askopenfilename(title="Choose Adobe Premiere Pro",
+                                          filetypes=[("Program", "*.exe *.app"), ("All files", "*.*")])
+        if path:
+            settings_vars["premiere_exe"].set(path)
+
+    paths_group = ttk.LabelFrame(paths_tab, text=" Locations ", padding=12)
+    paths_group.pack(fill="x")
+    paths_group.columnconfigure(1, weight=1)
+    location_rows = [
+        ("Projects folder", "projects_dir", pick_folder(settings_vars["projects_dir"], "Choose projects folder"),
+         "Each run gets its own sub-folder here. Created automatically if missing."),
+        ("Media download folder", "media_dir", pick_folder(settings_vars["media_dir"], "Choose media download folder"),
+         "Images and downloaded video clips, one sub-folder per run. Created automatically if missing."),
+        ("Speech model folder", "models_dir", pick_folder(settings_vars["models_dir"], "Choose speech model folder"),
+         "faster-whisper downloads the chosen model here the first time it is used (0.5–1.6 GB), then reuses it."),
+        ("Premiere Pro program", "premiere_exe", pick_program,
+         "Used by 'Run Premiere Pro with Skeleton'. Detected automatically when possible."),
+    ]
+    for r, (label, key, command, hint) in enumerate(location_rows):
+        ttk.Label(paths_group, text=label, font=(UI_FONT, 10, "bold")).grid(row=r * 2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(paths_group, textvariable=settings_vars[key]).grid(row=r * 2, column=1, sticky="ew", padx=8, pady=(6, 0))
+        ttk.Button(paths_group, text="Browse…", command=command).grid(row=r * 2, column=2, pady=(6, 0))
+        ttk.Label(paths_group, text=hint, foreground=MUTED, font=(UI_FONT, 9)).grid(row=r * 2 + 1, column=1, sticky="w", padx=8)
+
+    options_group = ttk.LabelFrame(paths_tab, text=" Options ", padding=12)
+    options_group.pack(fill="x", pady=(12, 0))
+    ttk.Checkbutton(options_group, text="Download linked videos (YouTube, other sites, direct files, Drive) and keep extra handles",
+                    variable=settings_vars["videos"]).grid(row=0, column=0, columnspan=6, sticky="w")
+
+    def labelled(row, col, text, var, width, unit=""):
+        ttk.Label(options_group, text=text).grid(row=row, column=col, sticky="w", pady=6, padx=(0, 6))
+        ttk.Entry(options_group, textvariable=var, width=width).grid(row=row, column=col + 1, sticky="w")
+        if unit:
+            ttk.Label(options_group, text=unit, foreground=MUTED).grid(row=row, column=col + 2, sticky="w", padx=(4, 18))
+
+    labelled(1, 0, "Download whole videos up to", settings_vars["limit_minutes"], 6, "min")
+    labelled(1, 3, "Handles per side", settings_vars["buffer_minutes"], 6, "min")
+    labelled(2, 0, "Resolution", settings_vars["width"], 6, "×")
+    ttk.Entry(options_group, textvariable=settings_vars["height"], width=6).grid(row=2, column=3, sticky="w")
+    ttk.Label(options_group, text="Speech model").grid(row=3, column=0, sticky="w", pady=6)
+    ttk.Combobox(options_group, textvariable=settings_vars["whisper_model"], values=WHISPER_MODELS, width=18).grid(row=3, column=1, sticky="w")
+    ttk.Label(options_group, text="Runs on").grid(row=3, column=3, sticky="w", padx=(0, 6))
+    ttk.Combobox(options_group, textvariable=settings_vars["device"], values=["auto", "cpu", "cuda"], state="readonly", width=8).grid(row=3, column=4, sticky="w")
+    ttk.Label(options_group, text="Speech recognition runs on your computer (faster-whisper). 'auto' uses the graphics card when available.",
+              foreground=MUTED, font=(UI_FONT, 9)).grid(row=4, column=0, columnspan=6, sticky="w", pady=(6, 0))
+
+    # ---------------- Build tab ----------------
+    preset_row = ttk.Frame(build_tab)
+    preset_row.pack(fill="x", pady=(0, 10))
+    ttk.Label(preset_row, text="Channel / preset", font=(UI_FONT, 10, "bold")).pack(side="left")
+    preset_combo = ttk.Combobox(preset_row, textvariable=settings_vars["preset"], values=list(PRESETS), state="readonly", width=40)
+    preset_combo.pack(side="left", padx=8)
+
+    def on_preset_change(_=None):
+        chosen = PRESETS.get(settings_vars["preset"].get())
+        if chosen:
+            settings_vars["width"].set(str(chosen["width"]))
+            settings_vars["height"].set(str(chosen["height"]))
+            settings_vars["limit_minutes"].set(str(chosen["limit"]))
+            settings_vars["buffer_minutes"].set(str(chosen["handles"]))
+
+    preset_combo.bind("<<ComboboxSelected>>", on_preset_change)
+
+    inputs_group = ttk.LabelFrame(build_tab, text=" Inputs ", padding=12)
+    inputs_group.pack(fill="x")
+    inputs_group.columnconfigure(1, weight=1)
+    script_var, audio_var = tk.StringVar(), tk.StringVar()
+    inspect_status = tk.StringVar(value="Paste a Google Doc link or choose a .docx script.")
+
+    def status(text):
+        inspect_status.set(text)
+        window.update_idletasks()
+
+    def resolve_script(quiet=True):
+        """Download a Google Doc link (if given), then check the script. Returns the local path or None."""
+        value = script_var.get().strip()
+        if not value:
+            return None
+        if is_google_doc_url(value):
+            status("⏳ Downloading Google Doc…")
+            try:
+                value = str(download_google_doc(value))
+            except Exception as err:
+                status(f"❌ Google Doc error: {err}")
+                if not quiet:
+                    messagebox.showerror("Google Doc Error", str(err))
+                return None
+            script_var.set(value)
+        if not Path(value).is_file():
+            status(f"❌ Script file not found: {value}")
+            return None
+        result = inspect_docx(value)
+        if not result.get("valid"):
+            status(f"❌ Script check failed: {result.get('error')}")
+            return None
+        note = f"✓ {Path(value).stem}: {result['image_cues']} image cue(s), {result['video_cues']} video cue(s), {result['word_count']} words."
+        if result.get("warnings"):
+            note += f" {len(result['warnings'])} warning(s): {result['warnings'][0]}"
+        status(note)
+        return value
+
+    def add_input(row, label, var, hint, extensions, on_change=None):
+        ttk.Label(inputs_group, text=label, font=(UI_FONT, 10, "bold")).grid(row=row * 2, column=0, sticky="w", pady=(4, 0))
+        entry = ttk.Entry(inputs_group, textvariable=var)
+        entry.grid(row=row * 2, column=1, sticky="ew", padx=8, pady=(4, 0))
+
+        def browse():
+            path = filedialog.askopenfilename(title=f"Choose {label}", filetypes=[(label, extensions), ("All files", "*.*")])
+            if path:
+                var.set(path)
+                if on_change:
+                    on_change()
+
+        ttk.Button(inputs_group, text="Browse…", command=browse).grid(row=row * 2, column=2, pady=(4, 0))
+        ttk.Label(inputs_group, text=hint, foreground=MUTED, font=(UI_FONT, 9)).grid(row=row * 2 + 1, column=1, sticky="w", padx=8)
+        if on_change:
+            entry.bind("<Return>", lambda _e: on_change())
+            entry.bind("<FocusOut>", lambda _e: on_change())
+        return entry
+
+    script_entry = add_input(0, "Script", script_var, "Google Doc link (must be viewable by anyone with the link) or a .docx file.", "*.docx", resolve_script)
+    audio_entry = add_input(1, "Voiceover", audio_var, "Drop an audio file here, paste a Google Drive link, or browse.", "*.mp3 *.wav *.m4a *.aac *.flac")
+    ttk.Label(inputs_group, textvariable=inspect_status, wraplength=780, justify="left").grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+
+    def on_drop(event):
+        for raw in window.tk.splitlist(event.data):
+            ext = Path(raw).suffix.lower()
+            if ext == ".docx":
+                script_var.set(raw)
+                resolve_script()
+            elif ext in AUDIO_EXT:
+                audio_var.set(raw)
+        return event.action
+
+    if TkinterDnD:
+        for widget in (build_tab, inputs_group, script_entry, audio_entry):
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", on_drop)
+
+    build_frame = ttk.Frame(build_tab)
+    build_frame.pack(fill="x", pady=(14, 0))
+    progress_bar = ttk.Progressbar(build_frame, mode="indeterminate")
+    phase_label = ttk.Label(build_frame, text="", foreground=MUTED)
+
+    def open_path(path):
+        try:
+            p = Path(path)
+            if not p.exists():
+                raise ValueError("This folder or file has not been created yet.")
+            if sys.platform == "darwin":
+                subprocess.run(["open", str(p)], check=True)
+            elif os.name == "nt":
+                os.startfile(str(p))
+            else:
+                subprocess.run(["xdg-open", str(p)], check=True)
+        except Exception as error:
+            messagebox.showerror("Could not open", str(error))
+
+    def launch():
+        try:
+            docx = resolve_script(quiet=False)
+            if not docx:
+                raise ValueError("Choose a script first (.docx or Google Doc link).")
+            audio = audio_var.get().strip()
+            if not audio or not (is_drive_url(audio) or Path(audio).is_file()):
+                raise ValueError("Choose the voiceover: drop an audio file or paste a Google Drive link.")
+            width, height = int(settings_vars["width"].get()), int(settings_vars["height"].get())
+            limit_minutes, buffer_minutes = float(settings_vars["limit_minutes"].get()), float(settings_vars["buffer_minutes"].get())
+            if width <= 0 or height <= 0:
+                raise ValueError("Width and height must be positive numbers.")
+            if not 1 <= limit_minutes <= 1440 or not 0 <= buffer_minutes <= 60:
+                raise ValueError("Use a limit of 1–1440 minutes and handles of 0–60 minutes.")
+            config = {
+                "docx": docx, "audio": audio, "title": Path(docx).stem,
+                "projects_dir": str(projects_dir({"projects_dir": settings_vars["projects_dir"].get().strip()})),
+                "media_dir": settings_vars["media_dir"].get().strip(),
+                "videos": settings_vars["videos"].get(), "limit_minutes": limit_minutes, "buffer_minutes": buffer_minutes,
+                "width": width, "height": height, "preset": settings_vars["preset"].get(),
+                "whisper_model": settings_vars["whisper_model"].get().strip() or "small.en",
+                "device": settings_vars["device"].get(),
+                "models_dir": settings_vars["models_dir"].get().strip(),
+            }
+            folder = start_job(config)
+            selected[0] = str(folder)
+            refresh()
+        except Exception as error:
+            traceback.print_exc()
+            messagebox.showerror("Cannot start run", str(error))
+
+    build_btn = ttk.Button(build_frame, text="⚡  Build Skeleton", command=launch, padding=(14, 7))
+    build_btn.pack(side="left")
+    phase_label.pack(side="left", padx=14)
+    progress_bar.pack(side="right", fill="x", expand=True)
+
+    current_var = tk.StringVar(value="No run yet.")
+    result_group = ttk.LabelFrame(build_tab, text=" Latest / selected run ", padding=12)
+    result_group.pack(fill="x", pady=(14, 0))
+    ttk.Label(result_group, textvariable=current_var, wraplength=780, justify="left").pack(anchor="w", pady=(0, 8))
+
+    def chosen_run():
+        return known.get(selected[0]) or next(iter(known.values()), None)
+
+    def run_premiere():
+        xml = skeleton_xml(chosen_run())
+        if not xml:
+            messagebox.showwarning("Not ready", "This run has no Skeleton_full.xml yet.")
+            return
+        window.clipboard_clear()
+        window.clipboard_append(str(xml))  # fallback: paste into File > Import if Premiere does not import automatically
+        program = settings_vars["premiere_exe"].get().strip() or find_premiere()
+        try:
+            if program and sys.platform == "darwin":
+                subprocess.Popen(["open", "-a", program, str(xml)])
+            elif program:
+                subprocess.Popen([program, str(xml)])
+            else:
+                os.startfile(str(xml))
+        except Exception as error:
+            messagebox.showerror("Could not start Premiere Pro",
+                                 f"{error}\n\nSet the program in Paths & Options. The XML path is on your clipboard for File > Import.")
+
+    def open_project():
+        run = chosen_run()
+        if run:
+            open_path(run["folder"])
+
+    button_row = ttk.Frame(result_group)
+    button_row.pack(fill="x")
+    premiere_btn = ttk.Button(button_row, text="▶  Run Premiere Pro with Skeleton", command=run_premiere, padding=(10, 5))
+    premiere_btn.pack(side="left", padx=(0, 8))
+    ttk.Button(button_row, text="Open project folder", command=open_project, padding=(10, 5)).pack(side="left")
+
+    # ---------------- Runs tab ----------------
+    tree = ttk.Treeview(runs_tab, columns=("status", "date"), height=6)
+    tree.heading("#0", text="Project")
+    tree.heading("status", text="Status")
+    tree.heading("date", text="Created")
+    tree.column("#0", width=380)
+    tree.column("status", width=200)
+    tree.column("date", width=140)
+    tree.pack(fill="x", pady=(0, 8))
+    ttk.Label(runs_tab, text="Log", foreground=MUTED).pack(anchor="w")
+    log_box = tk.Text(runs_tab, height=12, wrap="word", font=("Consolas" if os.name == "nt" else "Menlo", 9), state="disabled",
+                      bg=PANEL, fg=FG, insertbackground=FG, relief="flat", highlightthickness=1, highlightbackground=BORDER)
+    log_box.pack(fill="both", expand=True)
+
+    def choose(_=None):
+        if tree.selection() and tree.selection()[0] != selected[0]:
+            selected[0] = tree.selection()[0]
+            last_log[0] = None
+            refresh()
+
+    tree.bind("<<TreeviewSelect>>", choose)
+
+    PHASES = [
+        (r"Downloading voiceover", "Step 1/5: Fetching voiceover from Google Drive…"),
+        (r"Loading .* locally|Timed through|Using cached word", "Step 2/5: Transcribing voiceover locally…"),
+        (r"Extracting bookmarked", "Step 3/5: Reading script & extracting images…"),
+        (r"Downloading (?!voiceover)|Preparing", "Step 4/5: Fetching images & video clips…"),
+        (r"validate_xml|Built ", "Step 5/5: Writing Premiere timeline…"),
+    ]
+
+    def phase_of(text):
+        best, label = -1, "Working…"
+        for pattern, name in PHASES:
+            hits = [m.start() for m in re.finditer(pattern, text)]
+            if hits and hits[-1] > best:
+                best, label = hits[-1], name
+        return label
+
+    def refresh():
+        current = runs(settings_vars["projects_dir"].get().strip() or None)
+        known.clear()
+        known.update({r["folder"]: r for r in current})
+        for iid in tree.get_children():
+            if iid not in known:
+                tree.delete(iid)
+        for r in current:
+            created = datetime.datetime.fromtimestamp(r["created"]).strftime("%Y-%m-%d %H:%M") if r.get("created") else ""
+            args = {"text": Path(r["folder"]).name, "values": (r["display_status"], created)}
+            if tree.exists(r["folder"]):
+                tree.item(r["folder"], **args)
+            else:
+                tree.insert("", "end", iid=r["folder"], **args)
+
+        running = any(r["display_status"] in ("Running", "Starting") for r in current)
+        build_btn.configure(state="disabled" if running else "normal")
+        if not selected[0] and current:
+            selected[0] = next((r["folder"] for r in current if r["display_status"] == "Running"), current[0]["folder"])
+        if selected[0] and tree.exists(selected[0]) and tree.selection() != (selected[0],):
+            tree.selection_set(selected[0])
+
+        r = known.get(selected[0])
+        premiere_btn.configure(state="normal" if skeleton_xml(r) else "disabled")
+        if not r:
+            return
+        log_path = Path(r["folder"]) / "run.log"
+        text = "No saved log is available for this run."
+        if log_path.exists():
+            with log_path.open("rb") as f:
+                f.seek(max(0, log_path.stat().st_size - 40000))
+                text = f.read().decode("utf-8", errors="replace")
+        d_status = r["display_status"]
+        current_var.set(f"{Path(r['folder']).name} — {d_status}")
+
+        if d_status in ("Running", "Starting"):
+            progress_bar.configure(mode="indeterminate")
+            progress_bar.start(10)
+            phase_label.config(text=phase_of(text))
+        else:
+            progress_bar.stop()
+            progress_bar.configure(mode="determinate")
+            done = d_status.startswith("Completed")
+            progress_bar["value"] = 100 if done else 0
+            phase_label.config(text="✓ Done — ready for Premiere Pro." if done else ("❌ Build failed. See the Runs tab." if "Failed" in d_status else ""))
+        if d_status not in ("Running", "Starting") and r["folder"] not in notified_runs:
+            notified_runs.add(r["folder"])
+            window.bell()
+        if last_log[0] != text:
+            log_box.configure(state="normal")
+            log_box.delete("1.0", "end")
+            log_box.insert("end", text)
+            log_box.see("end")
+            log_box.configure(state="disabled")
+            last_log[0] = text
+
+    def poll():
+        try:
+            refresh()
+        except Exception as error:
+            current_var.set(f"Status refresh error: {error}")
+        window.after(1500, poll)
+
+    def close():
+        if any(r["display_status"] in ("Running", "Starting") for r in known.values()):
+            if not messagebox.askokcancel(
+                "Keep working in background?",
+                "The build will continue in the background. Reopen Skeleton Builder any time to check progress.\n\nClose window?",
+            ):
+                return
+        window.destroy()
+
+    window.protocol("WM_DELETE_WINDOW", close)
+    poll()
+    if smoke_test:
+        window.after(250, window.destroy)
+    window.mainloop()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+faster-whisper==1.2.1
+Pillow==12.3.0
+lxml==6.1.3
+yt-dlp[default]==2026.8.19
+tkinterdnd2
+imageio-ffmpeg
+av

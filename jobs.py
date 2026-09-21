@@ -1,0 +1,150 @@
+"""Persistent jobs independent of the desktop window."""
+import datetime
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import uuid
+
+from paths import FROZEN, ROOT, cache_dir
+
+SETTINGS = cache_dir() / 'desktop-settings.json'
+
+
+def read_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError):
+        return {} if default is None else default
+
+
+def write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    tmp.write_text(json.dumps(data, indent=2))
+    tmp.replace(path)
+
+
+def alive(pid):
+    if not pid:
+        return False
+    try:
+        pid = int(pid)
+        if os.name == "nt":
+            # os.kill(pid, 0) would TERMINATE the process on Windows, so query it instead.
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False
+            try:
+                code = ctypes.c_ulong()
+                return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+            finally:
+                kernel32.CloseHandle(handle)
+        os.kill(pid, 0)
+        status = subprocess.run(["ps", "-p", str(pid), "-o", "stat="], capture_output=True, text=True).stdout.strip()
+        return bool(status) and not status.startswith("Z")
+    except (OSError, ValueError):
+        return False
+
+
+def inspect_run(folder):
+    folder = Path(folder)
+    state = read_json(folder/'run.json')
+    result = Path(state.get('result', folder))
+    active = state.get('status') in ('running', 'starting') and alive(state.get('pid'))
+    if active:
+        status = 'Running'
+    elif state.get('status') == 'starting' and (datetime.datetime.now().timestamp()-state.get('created', 0)) < 15:
+        status = 'Starting'
+    elif state.get('status') == 'failed':
+        status = 'Failed — see log'
+    elif (result/'Skeleton_full.xml').exists() and (result/'START HERE.txt').exists():
+        manifest = read_json(result/'manifest.json')
+        notes = manifest.get('warnings', []) + [n for c in manifest.get('cues', []) for n in c.get('review', [])]
+        status = 'Completed — review notes' if notes else 'Completed'
+    else:
+        status = 'Interrupted / incomplete'
+    return {**state, 'folder': str(folder), 'result': str(result), 'display_status': status}
+
+
+def documents_dir():
+    """The user's Documents folder (follows OneDrive redirection on Windows)."""
+    if os.name == 'nt':
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(260)
+            if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0 and buf.value:  # CSIDL_PERSONAL
+                return Path(buf.value)
+        except Exception:
+            pass
+    return Path.home() / 'Documents'
+
+
+DEFAULT_HOME = documents_dir() / 'Premiere Skeleton Builder'
+DEFAULT_PROJECTS = DEFAULT_HOME / 'Projects'
+DEFAULT_MEDIA = DEFAULT_HOME / 'Media'
+DEFAULT_MODELS = DEFAULT_HOME / 'Models'  # speech-recognition model files (downloaded on first use)
+
+
+def projects_dir(settings=None):
+    """Folder that holds one sub-folder per run; configurable in the Paths tab."""
+    chosen = (settings if settings is not None else read_json(SETTINGS)).get('projects_dir')
+    return Path(chosen) if chosen else DEFAULT_PROJECTS
+
+
+def runs(root=None):
+    root = Path(root) if root else projects_dir()
+    if not root.is_dir():
+        return []
+    found = [p for p in root.iterdir() if p.is_dir() and (p/'run.json').exists()]
+    return [inspect_run(p) for p in sorted(found, key=lambda p: p.stat().st_mtime, reverse=True)]
+
+
+def safe_name(title, limit=80):
+    cleaned = ''.join('_' if c in '<>:"/|?*' + chr(92) or ord(c) < 32 else c for c in str(title)).strip(' .')
+    return cleaned[:limit].strip(' .') or 'Untitled script'
+
+
+def unique_folder(root, title):
+    root = Path(root)
+    base = safe_name(title)
+    folder, n = root/base, 2
+    while folder.exists():
+        folder, n = root/f'{base} ({n})', n + 1
+    return folder
+
+
+def run_layout(folder, media_root=None):
+    """Common structure for every run."""
+    folder = Path(folder)
+    media = Path(media_root)/folder.name if media_root else folder/'Media'
+    return {'script': folder/'Script', 'audio': folder/'Audio', 'timeline': folder/'Timeline', 'media': media}
+
+
+def start_job(config):
+    root = Path(config['projects_dir']) if config.get('projects_dir') else projects_dir()
+    if any(r['display_status'] in ('Running', 'Starting') for r in runs(root)):
+        raise ValueError('A run is already working. Select it below to see its progress.')
+    folder = unique_folder(root, config.get('title') or Path(config['docx']).stem)
+    layout = run_layout(folder, config.get('media_dir'))
+    for path in (folder, *layout.values()):
+        path.mkdir(parents=True, exist_ok=True)
+    state = {'status':'starting', 'created':datetime.datetime.now().timestamp(), 'config':config, 'result':str(layout['timeline'])}
+    write_json(folder/'run.json', state)
+    env = {**os.environ, 'PYTHONUNBUFFERED':'1', 'PYTHONIOENCODING':'utf-8'}
+    env['PATH'] = str(Path.home()/'.local/share/skeleton-builder-tools/runtime/bin')+os.pathsep+env.get('PATH','')
+    try:
+        options = ({'creationflags':subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt' else {'start_new_session':True})
+        # A packaged app re-runs itself in worker mode; from source it runs job_worker.py.
+        worker = [sys.executable, '--worker', str(folder)] if FROZEN else [sys.executable, str(ROOT/'job_worker.py'), str(folder)]
+        with (folder/'run.log').open('ab') as log:
+            subprocess.Popen(worker, cwd=folder,
+                stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=env, **options)
+    except Exception as error:
+        write_json(folder/'run.json', {**state, 'status':'failed', 'error':str(error)})
+        raise
+    return folder
