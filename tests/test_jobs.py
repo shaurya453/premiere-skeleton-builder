@@ -56,3 +56,32 @@ class JobTests(unittest.TestCase):
         with patch('jobs.runs',return_value=[{'display_status':'Running'}]):
             with self.assertRaisesRegex(ValueError,'already working'):
                 jobs.start_job({})
+
+    def test_queue_is_first_in_first_out_and_supports_removal(self):
+        with tempfile.TemporaryDirectory() as t:
+            with patch('jobs.QUEUE',Path(t)/'queue.json'):
+                self.assertEqual(jobs.read_queue(),[])
+                self.assertIsNone(jobs.dequeue_next())
+                first=jobs.enqueue({'title':'First'})
+                jobs.enqueue({'title':'Second'})
+                third=jobs.enqueue({'title':'Third'})
+                self.assertEqual([i['title'] for i in jobs.read_queue()],['First','Second','Third'])
+                jobs.remove_from_queue(third)
+                self.assertEqual([i['title'] for i in jobs.read_queue()],['First','Second'])
+                popped=jobs.dequeue_next()
+                self.assertEqual(popped['id'],first)
+                self.assertEqual(popped['config']['title'],'First')
+                self.assertEqual([i['title'] for i in jobs.read_queue()],['Second'])
+
+    def test_moving_a_location_merges_files_and_handles_collisions(self):
+        with tempfile.TemporaryDirectory() as t:
+            root=Path(t); old,new=root/'old',root/'new'
+            (old/'RunA').mkdir(parents=True); (old/'RunA'/'run.json').write_text('{}')
+            (old/'RunB.txt').write_text('hello')
+            new.mkdir(); (new/'RunC').mkdir()
+            self.assertEqual(jobs.transfer_folder_contents(old,new),[])
+            self.assertEqual(sorted(p.name for p in new.iterdir()),['RunA','RunB.txt','RunC'])
+            self.assertFalse(old.exists())
+            self.assertTrue((new/'RunA'/'run.json').exists())
+            # same directory: a harmless no-op
+            self.assertEqual(jobs.transfer_folder_contents(new,new),[])

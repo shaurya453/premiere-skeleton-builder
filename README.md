@@ -7,8 +7,14 @@ FCP7 XML timeline for Premiere. Speech timing comes from local faster-whisper
 Open **Open Skeleton Builder.cmd** (Windows) or **Skeleton Builder.app** (Mac), then:
 
 1. **Paths & Options** (once): projects folder, media download folder, Premiere Pro location.
-2. **Build**: paste the Google Doc link, drop the voiceover (or paste a Google Drive link), click **Build Skeleton**.
-3. **Run Premiere Pro with Skeleton** opens the finished timeline in Premiere.
+2. **Build**: paste the Google Doc link, drop the voiceover (or paste a Google Drive link).
+   **Preview cues** shows which script passages matched which image/video before running
+   anything — no download or speech recognition, just the doc parsing, so it's instant.
+3. Click **Build Skeleton**. If a build is already running, the new one is added to the
+   **Queue** and starts automatically as soon as the current one finishes — submit several
+   in a row without waiting. The first-run speech model download shows live progress
+   ("Downloading speech model — 42% (320 MB / 760 MB)") instead of sitting silently.
+4. **Run Premiere Pro with Skeleton** opens the finished timeline in Premiere.
 
 By default, `Projects`, `Media` and `Models` folders are created next to the app itself
 (alongside `SkeletonBuilder.exe`/`Premiere Skeleton Builder.app`, or the project root when
@@ -20,6 +26,8 @@ Each run creates `<projects folder>/<Google Doc title>/` with `Script/`, `Audio/
 `Timeline/` (the XML files), `Media/` (images and downloaded videos, or
 `<media folder>/<title>/` when a media folder is set), plus `run.json` and `run.log`.
 Runs continue independently when the window is closed; reopen the app to see progress.
+(The queue itself only advances while the app is open — closing it pauses the queue, and
+reopening resumes it, same as an in-progress run.)
 Download and speech caches are reused. Keep the computer awake while processing.
 If a run fails (e.g. a network hiccup while fetching the script or voiceover), select it in
 **Runs** and use **Retry script & audio fetch** to try again with the same inputs.

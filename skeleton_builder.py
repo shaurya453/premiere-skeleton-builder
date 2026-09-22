@@ -257,6 +257,27 @@ def inspect_docx(path):
         return {"valid": False, "error": str(e)}
 
 
+def preview_cues(path):
+    """Lightweight cue-by-cue preview for the UI: no network access, no speech recognition —
+    just the same doc parsing / cue matching `inspect_docx` uses. `path` must already be a
+    local .docx file (resolve a Google Doc link first). Returns (cues, warnings) where each
+    cue is {kind, passage, targets, asset_path}; asset_path is set only for embedded images
+    (extracted directly from the docx, so no network access is needed to know their path).
+    Embedded images are cached under cache_dir()/preview/<doc hash> so the returned paths
+    stay valid after this call returns (unlike a temp directory, which would be deleted)."""
+    path = Path(path)
+    assets_dir = cache_dir() / "preview" / hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:16]
+    _, cues, _, warnings = read_docx(path, assets_dir, fetch_web=False)
+    preview = [{
+        "kind": cue["kind"],
+        "passage": cue["passage"],
+        "targets": [ref["target"] for ref in cue["refs"]],
+        "asset_path": next((ref["asset"]["path"] for ref in cue["refs"]
+                             if ref.get("asset") and ref["asset"].get("path")), None),
+    } for cue in cues]
+    return preview, warnings
+
+
 def token_mapping(source, target):
     mapping = {}
     for block in SequenceMatcher(None, source, target, autojunk=False).get_matching_blocks():

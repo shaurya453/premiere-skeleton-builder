@@ -19,8 +19,9 @@ except Exception:  # drag and drop is optional
     DND_FILES = TkinterDnD = None
 
 from jobs import (ROOT, SETTINGS, DEFAULT_PROJECTS, DEFAULT_MEDIA, DEFAULT_MODELS, read_json, write_json,
-                   runs, start_job, projects_dir, transfer_folder_contents)
-from skeleton_builder import inspect_docx
+                   runs, start_job, projects_dir, transfer_folder_contents,
+                   read_queue, enqueue, dequeue_next, remove_from_queue)
+from skeleton_builder import inspect_docx, preview_cues
 from google_docs import is_google_doc_url, download_google_doc
 from drive_audio import is_drive_url
 
@@ -421,9 +422,10 @@ def main(smoke_test: bool = False):
                     raise ValueError("Width and height must be positive numbers.")
                 if not 1 <= limit_minutes <= 1440 or not 0 <= buffer_minutes <= 60:
                     raise ValueError("Use a limit of 1–1440 minutes and handles of 0–60 minutes.")
+                root = projects_dir({"projects_dir": settings_vars["projects_dir"].get().strip()})
                 config = {
                     "docx": docx, "docx_source": script_var.get().strip(), "audio": audio, "title": Path(docx).stem,
-                    "projects_dir": str(projects_dir({"projects_dir": settings_vars["projects_dir"].get().strip()})),
+                    "projects_dir": str(root),
                     "media_dir": settings_vars["media_dir"].get().strip(),
                     "videos": settings_vars["videos"].get(), "limit_minutes": limit_minutes, "buffer_minutes": buffer_minutes,
                     "width": width, "height": height, "preset": settings_vars["preset"].get(),
@@ -431,8 +433,15 @@ def main(smoke_test: bool = False):
                     "device": settings_vars["device"].get(),
                     "models_dir": settings_vars["models_dir"].get().strip(),
                 }
-                folder = start_job(config)
-                selected[0] = str(folder)
+                busy = any(r["display_status"] in ("Running", "Starting") for r in runs(root))
+                if busy:
+                    enqueue(config)
+                    render_queue()
+                    messagebox.showinfo("Added to queue",
+                                        f'A build is already running — "{config["title"]}" will start automatically once it finishes.')
+                else:
+                    folder = start_job(config)
+                    selected[0] = str(folder)
                 refresh()
             except Exception as error:
                 traceback.print_exc()
@@ -442,10 +451,93 @@ def main(smoke_test: bool = False):
 
         resolve_script_async(quiet=False, then=finish_launch)
 
+    def render_preview(title, cues, warnings):
+        top = tk.Toplevel(window)
+        top.title(f"Cue preview — {title}")
+        top.geometry("820x520")
+        top.configure(bg=BG)
+        ttk.Label(top, text=f"{len(cues)} cue(s) matched — no download or transcription was run.",
+                  foreground=MUTED, background=BG).pack(anchor="w", padx=12, pady=(10, 4))
+
+        tree = ttk.Treeview(top, columns=("kind", "target"), height=16)
+        tree.heading("#0", text="Script passage")
+        tree.heading("kind", text="Kind")
+        tree.heading("target", text="Target")
+        tree.column("#0", width=420)
+        tree.column("kind", width=70, anchor="center")
+        tree.column("target", width=280)
+        tree.pack(fill="both", expand=True, padx=12)
+        for i, cue in enumerate(cues):
+            tree.insert("", "end", iid=str(i), text=cue["passage"],
+                        values=(cue["kind"], "; ".join(cue["targets"]) or (cue["asset_path"] or "")))
+
+        if warnings:
+            ttk.Label(top, text=f"{len(warnings)} warning(s):", foreground=MUTED, background=BG).pack(
+                anchor="w", padx=12, pady=(10, 0))
+            box = tk.Text(top, height=5, wrap="word", bg=PANEL, fg=FG, insertbackground=FG,
+                          relief="flat", highlightthickness=1, highlightbackground=BORDER)
+            box.pack(fill="x", padx=12, pady=(2, 12))
+            box.insert("end", "\n".join(warnings))
+            box.configure(state="disabled")
+        else:
+            ttk.Frame(top, height=12, style="TFrame").pack()
+
+    def preview():
+        preview_btn.configure(state="disabled")
+
+        def after_resolve(docx):
+            if not docx:
+                preview_btn.configure(state="normal")
+                return  # resolve_script_async already showed the error (quiet=False)
+
+            def worker():
+                try:
+                    cues, warnings = preview_cues(docx)
+                    window.after(0, lambda: render_preview(Path(docx).stem, cues, warnings))
+                except Exception as error:
+                    traceback.print_exc()
+                    window.after(0, lambda: messagebox.showerror("Cannot preview", str(error)))
+                finally:
+                    window.after(0, lambda: preview_btn.configure(state="normal"))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        resolve_script_async(quiet=False, then=after_resolve)
+
     build_btn = ttk.Button(build_frame, text="⚡  Build Skeleton", command=launch, padding=(14, 7))
     build_btn.pack(side="left")
+    preview_btn = ttk.Button(build_frame, text="👁  Preview cues", command=preview, padding=(10, 7))
+    preview_btn.pack(side="left", padx=(8, 0))
     phase_label.pack(side="left", padx=14)
     progress_bar.pack(side="right", fill="x", expand=True)
+
+    # ---------------- Queue: extra submissions while a build is already running ----------------
+    queue_group = ttk.LabelFrame(build_tab, text=" Queue ", padding=12)
+    queue_group.pack(fill="x", pady=(14, 0))
+    queue_list = tk.Listbox(queue_group, height=3, bg=PANEL, fg=FG, selectbackground=ACCENT,
+                            selectforeground="#ffffff", relief="flat", highlightthickness=1,
+                            highlightbackground=BORDER, activestyle="none")
+    queue_list.pack(side="left", fill="x", expand=True)
+    queue_ids = []
+
+    def remove_selected_queue_item():
+        selection = queue_list.curselection()
+        if not selection or selection[0] >= len(queue_ids):
+            return
+        remove_from_queue(queue_ids[selection[0]])
+        render_queue()
+
+    ttk.Button(queue_group, text="Remove", command=remove_selected_queue_item).pack(side="left", padx=(8, 0), anchor="n")
+
+    def render_queue():
+        items = read_queue()
+        queue_ids[:] = [i["id"] for i in items]
+        queue_list.delete(0, "end")
+        for i in items:
+            queue_list.insert("end", i.get("title") or "Untitled")
+        queue_group.configure(text=f" Queue ({len(items)} waiting) " if items else " Queue (empty — builds run immediately) ")
+
+    render_queue()
 
     current_var = tk.StringVar(value="No run yet.")
     result_group = ttk.LabelFrame(build_tab, text=" Latest / selected run ", padding=12)
@@ -544,13 +636,23 @@ def main(smoke_test: bool = False):
         (r"validate_xml|Built ", "Step 5/5: Writing Premiere timeline…"),
     ]
 
+    MODEL_DL_RE = re.compile(r"MODEL_DL (\d+) (\d+) (\d+)")
+
     def phase_of(text):
+        """Return (label, download_percent). download_percent is None unless the speech
+        model download is the most recent event, in which case the progress bar switches
+        to a determinate percentage instead of the usual indeterminate spinner."""
         best, label = -1, "Working…"
         for pattern, name in PHASES:
             hits = [m.start() for m in re.finditer(pattern, text)]
             if hits and hits[-1] > best:
                 best, label = hits[-1], name
-        return label
+        dl_hits = list(MODEL_DL_RE.finditer(text))
+        if dl_hits and dl_hits[-1].start() > best:
+            pct, done, total = dl_hits[-1].groups()
+            mb = lambda b: f"{int(b) / 1_000_000:.0f} MB"
+            return f"Step 2/5: Downloading speech model — {pct}% ({mb(done)} / {mb(total)})…", int(pct)
+        return label, None
 
     def refresh():
         current = runs(settings_vars["projects_dir"].get().strip() or None)
@@ -568,7 +670,21 @@ def main(smoke_test: bool = False):
                 tree.insert("", "end", iid=r["folder"], **args)
 
         running = any(r["display_status"] in ("Running", "Starting") for r in current)
-        build_btn.configure(state="disabled" if (running or resolving[0]) else "normal")
+        if not running:
+            entry = dequeue_next()
+            if entry:
+                try:
+                    folder = start_job(entry["config"])
+                    selected[0] = str(folder)
+                    running = True
+                except Exception as error:
+                    traceback.print_exc()
+                    messagebox.showerror("Cannot start queued run", f'{entry.get("title") or "Untitled"}: {error}')
+                render_queue()
+        # A busy run no longer blocks Build — a new submission is queued and starts
+        # automatically once the current one finishes (see the queue-advance above).
+        build_btn.configure(state="disabled" if resolving[0] else "normal")
+        preview_btn.configure(state="disabled" if resolving[0] else "normal")
         if not selected[0] and current:
             selected[0] = next((r["folder"] for r in current if r["display_status"] == "Running"), current[0]["folder"])
         if selected[0] and tree.exists(selected[0]) and tree.selection() != (selected[0],):
@@ -591,9 +707,15 @@ def main(smoke_test: bool = False):
         current_var.set(f"{Path(r['folder']).name} — {d_status}")
 
         if d_status in ("Running", "Starting"):
-            progress_bar.configure(mode="indeterminate")
-            progress_bar.start(10)
-            phase_label.config(text=phase_of(text))
+            label, dl_pct = phase_of(text)
+            if dl_pct is not None:
+                progress_bar.stop()
+                progress_bar.configure(mode="determinate")
+                progress_bar["value"] = dl_pct
+            else:
+                progress_bar.configure(mode="indeterminate")
+                progress_bar.start(10)
+            phase_label.config(text=label)
         else:
             progress_bar.stop()
             progress_bar.configure(mode="determinate")

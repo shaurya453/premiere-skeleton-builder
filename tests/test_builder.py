@@ -8,7 +8,7 @@ from zipfile import ZipFile
 from lxml import etree as ET
 from PIL import Image
 
-from skeleton_builder import read_docx, timed_tokens, xml_sequence, inspect_docx
+from skeleton_builder import read_docx, timed_tokens, xml_sequence, inspect_docx, preview_cues
 
 
 class BookmarkTests(unittest.TestCase):
@@ -48,6 +48,15 @@ class BookmarkTests(unittest.TestCase):
             self.assertEqual(stat["video_cues"], 0)
             self.assertEqual(stat["word_count"], 4)
             self.assertEqual(stat["embedded_images"], 2)
+
+            # preview_cues gives the same cue without touching the network, and embedded
+            # images (unlike remote ones) already have a real, persistent local path.
+            preview, preview_warnings = preview_cues(root / "script.docx")
+            self.assertFalse(preview_warnings)
+            self.assertEqual(len(preview), 1)
+            self.assertEqual(preview[0]["kind"], "image")
+            self.assertEqual(preview[0]["passage"], "They found the book")
+            self.assertTrue(Path(preview[0]["asset_path"]).is_file())
 
     def test_wrong_audio_cache_rejected(self):
         with tempfile.TemporaryDirectory() as temp:

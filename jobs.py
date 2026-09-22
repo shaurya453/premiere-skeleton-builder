@@ -138,6 +138,41 @@ def transfer_folder_contents(old_dir, new_dir):
     return errors
 
 
+QUEUE = cache_dir() / 'queue.json'
+
+
+def read_queue():
+    return read_json(QUEUE, default=[])
+
+
+def write_queue(items):
+    write_json(QUEUE, items)
+
+
+def enqueue(config):
+    """Add a fully-resolved build config to the queue; advanced automatically once the
+    current run (if any) finishes. Returns the new entry's id (for removal)."""
+    items = read_queue()
+    entry = {'id': uuid.uuid4().hex, 'title': config.get('title') or 'Untitled',
+              'added': datetime.datetime.now().timestamp(), 'config': config}
+    items.append(entry)
+    write_queue(items)
+    return entry['id']
+
+
+def dequeue_next():
+    items = read_queue()
+    if not items:
+        return None
+    entry = items.pop(0)
+    write_queue(items)
+    return entry
+
+
+def remove_from_queue(entry_id):
+    write_queue([i for i in read_queue() if i['id'] != entry_id])
+
+
 def run_layout(folder, media_root=None):
     """Common structure for every run."""
     folder = Path(folder)
