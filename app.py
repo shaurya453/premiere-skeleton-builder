@@ -76,9 +76,42 @@ def apply_dark_theme(window):
             pass
 
 
+def _premiere_from_windows_registry():
+    """Installed-apps registry, so a Premiere install on a non-C: drive is still found —
+    Creative Cloud's custom install location is common for Premiere given its size, unlike
+    macOS where apps are essentially always under /Applications."""
+    import winreg
+    found = []
+    for path in (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                 r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"):
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path) as key:
+                for i in range(winreg.QueryInfoKey(key)[0]):
+                    try:
+                        with winreg.OpenKey(key, winreg.EnumKey(key, i)) as entry:
+                            name = winreg.QueryValueEx(entry, "DisplayName")[0]
+                            if "Premiere Pro" not in name:
+                                continue
+                            install = Path(winreg.QueryValueEx(entry, "InstallLocation")[0])
+                            exe = install / "Adobe Premiere Pro.exe"
+                            if exe.is_file():
+                                found.append((name, str(exe)))
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return sorted(found)[-1][1] if found else None
+
+
 def find_premiere():
     """Best-guess Premiere Pro program on this computer."""
     if os.name == "nt":
+        try:
+            found = _premiere_from_windows_registry()
+            if found:
+                return found
+        except Exception:
+            pass
         hits = glob.glob(r"C:\Program Files\Adobe\Adobe Premiere Pro*\Adobe Premiere Pro.exe")
     elif sys.platform == "darwin":
         hits = glob.glob("/Applications/Adobe Premiere Pro*/Adobe Premiere Pro*.app")
