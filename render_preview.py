@@ -10,7 +10,12 @@ from skeleton_builder import FPS
 
 def render(folder, duration=45):
     folder = Path(folder).resolve()
-    report = json.loads((folder/"manifest.json").read_text(encoding="utf-8"))
+    # manifest.json lives at Timeline/Data/manifest.json; fall back to the older
+    # Timeline/manifest.json layout for a run built by a previous version of the app.
+    manifest_path = folder/"Data"/"manifest.json"
+    if not manifest_path.is_file():
+        manifest_path = folder/"manifest.json"
+    report = json.loads(manifest_path.read_text(encoding="utf-8"))
     frames = min(round(duration*FPS), round(report["duration_seconds"]*FPS))
     output = folder / "Preview_first_45s.mp4"
     process = subprocess.Popen([

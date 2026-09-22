@@ -21,18 +21,41 @@ Open **Open Skeleton Builder.cmd** (Windows) or **Skeleton Builder.app** (Mac), 
    the app, so finish it there: File > Import (Ctrl/Cmd+I), then paste the path into the
    filename box and press Enter.
 
-By default, `Projects`, `Media`, `Models` and `Cache` folders are created next to the app
-itself (alongside `SkeletonBuilder.exe`/`Premiere Skeleton Builder.app`, or the project root
-when run from source) — nothing is written to Documents unless you point a location there
+By default, `Projects`, `Models` and `Cache` folders are created next to the app itself
+(alongside `SkeletonBuilder.exe`/`Premiere Skeleton Builder.app`, or the project root when
+run from source) — nothing is written to Documents unless you point a location there
 yourself. `Cache` holds regenerable working data (a script pasted as a Google Doc link,
 cue-preview images, cached YouTube sources); only small app state (settings, the build
-queue) stays in the OS profile folder mentioned below.
-Changing a location in **Paths & Options** offers to move the existing files across; runs are
-picked up from wherever `Projects folder` currently points.
+queue) stays in the OS profile folder mentioned below. Changing a location in
+**Paths & Options** offers to move the existing files across; runs are picked up from
+wherever `Projects folder` currently points.
 
-Each run creates `<projects folder>/<Google Doc title>/` with `Script/`, `Audio/`,
-`Timeline/` (the XML files), `Media/` (images and downloaded videos, or
-`<media folder>/<title>/` when a media folder is set), plus `run.json` and `run.log`.
+Each run gets its own self-contained folder, `<projects folder>/<Google Doc title>/`, laid
+out so the two files you actually read are right at the top and everything else is grouped
+by what it's for:
+
+```
+<Google Doc title>/
+├─ START HERE.txt      – what to do next, in order
+├─ Review.html         – open in a browser to audition every cue against the audio
+├─ run.json / run.log  – machine state and the full build log (also shown in the Runs tab)
+├─ Script/              the .docx (downloaded, if it was a Google Doc link)
+├─ Audio/                the voiceover, plus the converted voiceover.wav used in the XML
+├─ Media/                everything the timeline points at
+│  ├─ Images/            pictures extracted from the script or downloaded from the web
+│  └─ Videos/            prepared/trimmed video clips
+└─ Timeline/             the Premiere deliverables
+   ├─ Skeleton_full.xml       – import this: the complete sequence
+   ├─ Skeleton_test_45s.xml   – a quick first-45-seconds sanity check
+   ├─ Source_Selects.xml      – exact requested video excerpts (only if videos were fetched)
+   └─ Data/                    manifest.json + the timing CSVs (for scripting/inspection, not import)
+```
+
+Media defaults to living inside each project folder as shown above. Point **Media download
+folder** (Paths & Options) at a folder of your own only if you'd rather keep media separately
+— useful for putting large downloads on a bigger/faster drive — in which case it's organized
+as `<that folder>/<project name>/` instead.
+
 Runs continue independently when the window is closed; reopen the app to see progress.
 (The queue itself only advances while the app is open — closing it pauses the queue, and
 reopening resumes it, same as an in-progress run.)

@@ -22,6 +22,18 @@ class JobTests(unittest.TestCase):
             jobs.write_json(folder/'run.json',{'status':'failed','result':str(result)})
             self.assertEqual(jobs.inspect_run(folder)['display_status'],'Failed — see log')
 
+    def test_completed_state_recognized_with_the_current_file_layout(self):
+        # START HERE.txt lives at the project root and manifest.json under Timeline/Data/
+        # (not inside Timeline/ itself, unlike the older layout the test above covers).
+        with tempfile.TemporaryDirectory() as t:
+            folder=Path(t)
+            result=folder/'Timeline'; result.mkdir()
+            (result/'Skeleton_full.xml').write_text('test')
+            (folder/'START HERE.txt').write_text('test')
+            jobs.write_json(result/'Data'/'manifest.json',{'warnings':[]})
+            jobs.write_json(folder/'run.json',{'status':'completed','result':str(result)})
+            self.assertEqual(jobs.inspect_run(folder)['display_status'],'Completed')
+
     def test_worker_survives_launcher_exit_and_saves_failure_log(self):
         with tempfile.TemporaryDirectory() as t:
             root=Path(t); (root/'.cache').mkdir()

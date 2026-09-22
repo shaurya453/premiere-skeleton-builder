@@ -620,7 +620,7 @@ def write_report(out, report, voiceover):
     page = """<!doctype html><html><head><meta charset="utf-8"><title>Skeleton review</title>
 <style>body{font:16px/1.5 system-ui;background:#10141d;color:#eef1f6;max-width:1080px;margin:36px auto;padding:0 24px}h1{font-size:36px;margin-bottom:6px}h2{font-size:20px;margin:0 0 10px}p{max-width:850px}a{color:#91bcff}header{position:sticky;top:0;background:#10141df5;padding:14px 0;z-index:1}audio{width:100%}article{display:grid;grid-template-columns:210px 1fr;gap:28px;padding:24px 0;border-bottom:1px solid #30394a}article img{width:210px;height:190px;object-fit:contain;background:#080a0f}small{color:#aeb9cb}button{background:#283d5b;color:white;border:0;padding:8px 12px;border-radius:6px;cursor:pointer}.video{display:grid;place-items:center;background:#1a2434;color:#90a3bf}li{margin:8px 0}</style></head><body>
 <h1>Script → timeline</h1><p>Editable Premiere skeleton · 1920 × 1080 · 29.97 fps · approximate word boundaries</p>
-<p>Import <b>Skeleton_full.xml</b> into Premiere. V2 contains images and any prepared video clips; V1 contains removable guide cards in uncovered gaps; A1 contains narration. Prepared source audio is linked but disabled on A2/A3. <b>Source_Selects.xml</b>, when present, contains exact requested video excerpts with source sound enabled. Click a timing to listen to the narration.</p>
+<p>Import <b>Timeline/Skeleton_full.xml</b> into Premiere. V2 contains images and any prepared video clips; V1 contains removable guide cards in uncovered gaps; A1 contains narration. Prepared source audio is linked but disabled on A2/A3. <b>Timeline/Source_Selects.xml</b>, when present, contains exact requested video excerpts with source sound enabled. Click a timing to listen to the narration.</p>
 <header><audio id="player" controls src="__VO__"></audio></header>
 """ + f'<p>Timing: {esc(report["timing_method"])}.</p><ul>{warnings}</ul>' + "".join(rows) + """
 <script>document.querySelectorAll('button[data-time]').forEach(b=>b.addEventListener('click',()=>{const a=document.getElementById('player');a.currentTime=Number(b.dataset.time);a.play()}));</script></body></html>"""
@@ -657,8 +657,10 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
           download_videos=False, handles=600, full_videos=None, full_video_limit=5400,
           media_dir=None, audio_dir=None):
     out = Path(out).resolve()
-    media_dir = Path(media_dir).resolve() if media_dir else out / "media"
-    audio_dir = Path(audio_dir).resolve() if audio_dir else media_dir
+    # Match the GUI/job_worker layout (Media/ and Audio/ as siblings of Timeline/, not nested
+    # inside it) even when run standalone from the CLI without --media-dir/--audio-dir.
+    media_dir = Path(media_dir).resolve() if media_dir else out.parent / "Media"
+    audio_dir = Path(audio_dir).resolve() if audio_dir else out.parent / "Audio"
     if out.exists() and any(out.iterdir()):
         raise ValueError(f"Output folder is not empty: {out}. Choose a new folder to preserve previous runs.")
     out.mkdir(parents=True, exist_ok=True)
@@ -750,6 +752,11 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
         warnings.append(f"{len(unused)} embedded image(s) have no placed script cue; preserved in the image folder.")
     if any(c["start"] is None for c in cues):
         warnings.append("Some cues could not be aligned; see unmatched entries in this report.")
+    # Timeline/ holds just the XML deliverables; supporting data and the human-facing
+    # write-up live alongside it / at the project root so they're easy to tell apart.
+    run_root = out.parent
+    data_dir = out / "Data"
+    data_dir.mkdir(parents=True, exist_ok=True)
     report = {"duration_seconds": duration, "width": width, "height": height, "fps": "30000/1001",
               "timing_method": method, "script_token_match": round(coverage, 3),
               "sources": {"docx": str(Path(docx).resolve()), "audio": str(Path(audio).resolve())},
@@ -757,8 +764,8 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
               "unused_assets": unused, "embedded_assets": embedded,
               "video_assets": video_assets, "video_selects": video_selects,
               "video_options": {"enabled": download_videos, "handles_seconds": handles, "full_sources": full_videos, "full_video_limit_seconds": full_video_limit}}
-    (out / "manifest.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
-    with (out / "image-timings.csv").open("w", newline="", encoding="utf-8-sig") as f:
+    (data_dir / "manifest.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    with (data_dir / "image-timings.csv").open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(["Image", "Start seconds", "End seconds", "Start frame", "End frame", "Passage", "File", "Source"])
         for c in clips:
@@ -779,7 +786,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
                      [], selects_cues, None, video_selects[-1]["end_frame"]/FPS, width, height,
                      source_audio_enabled=True)
         validate_xml(out / "Source_Selects.xml")
-        with (out / "video-timings.csv").open("w", newline="", encoding="utf-8-sig") as f:
+        with (data_dir / "video-timings.csv").open("w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
             writer.writerow(["Clip", "Timeline start seconds", "Timeline end seconds", "Requested YouTube start",
                              "Requested YouTube end", "Media in frame", "Media out frame", "Left handle seconds",
@@ -789,25 +796,25 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
                 writer.writerow([c["name"], round(c["start_frame"]/FPS,3), round(c["end_frame"]/FPS,3),
                                  c["requested_source_start"], c["requested_source_end"], c["in_frame"], media_out,
                                  round(c["in_frame"]/FPS,3), round((c["source_duration_frames"]-media_out)/FPS,3), c["path"]])
-    write_report(out, report, wav)
-    (out / "START HERE.txt").write_text(
-        "PREMIERE SKELETON TEST\n\n1. In Premiere use File > Import and select Skeleton_test_45s.xml.\n"
+    write_report(run_root, report, wav)
+    (run_root / "START HERE.txt").write_text(
+        "PREMIERE SKELETON TEST\n\n1. In Premiere use File > Import and select Timeline/Skeleton_test_45s.xml.\n"
         "2. Open the imported sequence. Check image timing, fit and narration.\n"
-        "3. Import Skeleton_full.xml for the complete sequence.\n\n"
+        "3. Import Timeline/Skeleton_full.xml for the complete sequence.\n\n"
         "V2: editable images and prepared videos. V1: temporary guide cards in uncovered gaps. A1: narration.\n"
         "A2/A3: linked source-video sound, disabled so it does not compete with narration.\n"
         "Enable those audio clips in Premiere if source sound is wanted.\n"
-        "Source_Selects.xml (when present): exact full requested excerpts, source sound enabled.\n"
+        "Timeline/Source_Selects.xml (when present): exact full requested excerpts, source sound enabled.\n"
         "Video URLs and requested ranges are also in sequence markers. Failed downloads stay as markers.\n"
         "Main video placements start at the preceding paragraph/portion, play at normal speed, and\n"
         "are trimmed if too long for the passage. Shorter excerpts leave guide-card gaps.\n"
-        "Extend video edges to use the retained handles; consult video-timings.csv and Review.html.\n"
+        "Extend video edges to use the retained handles; consult Timeline/Data/video-timings.csv and Review.html.\n"
         "The spoken title at the start has no linked visual and remains a guide card.\n"
         "Timing uses approximate local speech-recognition word boundaries; check the cuts.\n"
-        "Review.html lets you audition each cue; manifest.json records every mapping and warning.\n"
-        "Keep the media folder. XML paths are absolute; if moving this package, relink media in Premiere.\n"
+        "Review.html lets you audition each cue; Timeline/Data/manifest.json records every mapping and warning.\n"
+        "Keep the Media folder. XML paths are absolute; if moving this package, relink media in Premiere.\n"
         "These XMLs have been structurally checked; import must still be tested in Premiere.\n", encoding="utf-8")
-    print(f"Built {len(clips)-len(video_edits)} images, {len(video_edits)} video edits and {len(video_selects)} exact source selects.\n{out}", flush=True)
+    print(f"Built {len(clips)-len(video_edits)} images, {len(video_edits)} video edits and {len(video_selects)} exact source selects.\n{run_root}", flush=True)
     return report
 
 

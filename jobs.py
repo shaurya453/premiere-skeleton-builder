@@ -63,8 +63,14 @@ def inspect_run(folder):
         status = 'Starting'
     elif state.get('status') == 'failed':
         status = 'Failed — see log'
-    elif (result/'Skeleton_full.xml').exists() and (result/'START HERE.txt').exists():
-        manifest = read_json(result/'manifest.json')
+    # START HERE.txt/manifest.json moved from Timeline/ to the project root/Timeline/Data
+    # respectively; check both locations so runs built by an older version of the app are
+    # still recognized as complete.
+    elif (result/'Skeleton_full.xml').exists() and ((result.parent/'START HERE.txt').exists() or (result/'START HERE.txt').exists()):
+        manifest_path = result/'Data'/'manifest.json'
+        if not manifest_path.exists():
+            manifest_path = result/'manifest.json'
+        manifest = read_json(manifest_path)
         notes = manifest.get('warnings', []) + [n for c in manifest.get('cues', []) for n in c.get('review', [])]
         status = 'Completed — review notes' if notes else 'Completed'
     else:

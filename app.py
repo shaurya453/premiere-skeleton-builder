@@ -163,7 +163,10 @@ def main(smoke_test: bool = False):
     # ---------------- Paths & Options tab (settings live here) ----------------
     settings_vars = {
         "projects_dir": tk.StringVar(value=saved.get("projects_dir") or str(DEFAULT_PROJECTS)),
-        "media_dir": tk.StringVar(value=saved.get("media_dir") or str(DEFAULT_MEDIA)),
+        # Blank by default: each run then keeps its media inside its own project folder
+        # (Projects/<title>/Media/) instead of a separate top-level Media/<title>/ tree,
+        # so "Open project folder" shows everything for a run in one place.
+        "media_dir": tk.StringVar(value=saved.get("media_dir", "")),
         "models_dir": tk.StringVar(value=saved.get("models_dir") or str(DEFAULT_MODELS)),
         "premiere_exe": tk.StringVar(value=saved.get("premiere_exe") or find_premiere()),
         "videos": tk.BooleanVar(value=saved.get("videos", True)),
@@ -182,8 +185,11 @@ def main(smoke_test: bool = False):
     for var in settings_vars.values():
         var.trace_add("write", save_settings)
     for key in ("projects_dir", "media_dir", "models_dir"):  # make sure the default locations exist
+        value = settings_vars[key].get().strip()
+        if not value:  # media_dir may be blank on purpose (each run uses its own Media folder)
+            continue
         try:
-            Path(settings_vars[key].get()).mkdir(parents=True, exist_ok=True)
+            Path(value).mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
     save_settings()
@@ -224,7 +230,25 @@ def main(smoke_test: bool = False):
         def handler(_e=None):
             new = settings_vars[key].get().strip()
             old = committed_locations[key]
-            if not new or new == old:
+            if new == old:
+                return
+            if not new:
+                # Only the media folder can be intentionally blank (per-project Media);
+                # projects/models always need a real folder, so an empty field there is
+                # just an incomplete edit — leave the previous value in place.
+                if key != "media_dir":
+                    settings_vars[key].set(old)
+                    return
+                if Path(old).is_dir() and any(Path(old).iterdir()) and not messagebox.askyesno(
+                    "Use each project's own Media folder?",
+                    f"Switch to keeping each new run's media inside its own project folder, "
+                    f"instead of the shared folder at:\n\n{old}\n\n"
+                    "Existing files there stay untouched; only new runs are affected."
+                ):
+                    settings_vars[key].set(old)
+                    return
+                committed_locations[key] = new
+                refresh()
                 return
             try:
                 Path(new).mkdir(parents=True, exist_ok=True)
@@ -232,14 +256,20 @@ def main(smoke_test: bool = False):
                 messagebox.showerror("Cannot use that folder", str(error))
                 settings_vars[key].set(old)
                 return
-            if offer_transfer(key, old, new):
+            # A blank `old` (media_dir's per-project default) has nothing in one place to
+            # offer moving — each existing run's media is already inside its own project
+            # folder — so skip straight to accepting the new shared location.
+            if not old:
+                committed_locations[key] = new
+                refresh()
+            elif offer_transfer(key, old, new):
                 committed_locations[key] = new
                 refresh()  # the Runs list re-scans the (possibly new) projects folder
         return handler
 
-    def pick_folder(key, title):
+    def pick_folder(key, title, suggested=None):
         def choose_folder():
-            path = filedialog.askdirectory(title=title, initialdir=settings_vars[key].get() or str(ROOT))
+            path = filedialog.askdirectory(title=title, initialdir=settings_vars[key].get() or suggested or str(ROOT))
             if path:
                 settings_vars[key].set(path)
                 commit_location(key)()
@@ -257,12 +287,15 @@ def main(smoke_test: bool = False):
     location_rows = [
         ("Projects folder", "projects_dir", pick_folder("projects_dir", "Choose projects folder"),
          "Each run gets its own sub-folder here. Created automatically if missing."),
-        ("Media download folder", "media_dir", pick_folder("media_dir", "Choose media download folder"),
-         "Images and downloaded video clips, one sub-folder per run. Created automatically if missing."),
+        ("Media download folder", "media_dir",
+         pick_folder("media_dir", "Choose media download folder", str(DEFAULT_MEDIA)),
+         "Leave blank (default) to keep each run's images/video inside its own project folder — "
+         "the clearest layout to browse. Set a folder here only to keep media separately (e.g. on "
+         "a bigger drive), organized as <this folder>/<project name>/."),
         ("Speech model folder", "models_dir", pick_folder("models_dir", "Choose speech model folder"),
          "faster-whisper downloads the chosen model here the first time it is used (0.5–1.6 GB), then reuses it."),
         ("Premiere Pro program", "premiere_exe", pick_program,
-         "Used by 'Run Premiere Pro with Skeleton'. Detected automatically when possible."),
+         "Used by 'Copy Skeleton Path & Open Premiere'. Detected automatically when possible."),
     ]
     for r, (label, key, command, hint) in enumerate(location_rows):
         ttk.Label(paths_group, text=label, font=(UI_FONT, 10, "bold")).grid(row=r * 2, column=0, sticky="w", pady=(6, 0))
