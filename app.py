@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import threading
 import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -230,11 +231,16 @@ def main(smoke_test: bool = False):
     inspect_status = tk.StringVar(value="Paste a Google Doc link or choose a .docx script.")
 
     def status(text):
-        inspect_status.set(text)
-        window.update_idletasks()
+        window.after(0, lambda: inspect_status.set(text))
+
+    resolving = [False]
 
     def resolve_script(quiet=True):
-        """Download a Google Doc link (if given), then check the script. Returns the local path or None."""
+        """Download a Google Doc link (if given), then check the script. Returns the local path or None.
+
+        Blocking: does network I/O. Only call this off the UI thread (see resolve_script_async),
+        except from launch(), which already runs inside its own background thread.
+        """
         value = script_var.get().strip()
         if not value:
             return None
@@ -245,9 +251,9 @@ def main(smoke_test: bool = False):
             except Exception as err:
                 status(f"❌ Google Doc error: {err}")
                 if not quiet:
-                    messagebox.showerror("Google Doc Error", str(err))
+                    window.after(0, lambda: messagebox.showerror("Google Doc Error", str(err)))
                 return None
-            script_var.set(value)
+            window.after(0, lambda: script_var.set(value))
         if not Path(value).is_file():
             status(f"❌ Script file not found: {value}")
             return None
@@ -260,6 +266,27 @@ def main(smoke_test: bool = False):
             note += f" {len(result['warnings'])} warning(s): {result['warnings'][0]}"
         status(note)
         return value
+
+    def resolve_script_async(quiet=True, then=None):
+        """Non-blocking wrapper: runs resolve_script() off the UI thread so a Google Doc
+        download (or a slow/unreachable link) never freezes the window."""
+        if resolving[0]:
+            return  # a resolve is already in flight; avoid piling up overlapping downloads
+        resolving[0] = True
+        script_entry.configure(state="disabled")
+
+        def worker():
+            try:
+                result = resolve_script(quiet=quiet)
+            finally:
+                def done():
+                    resolving[0] = False
+                    script_entry.configure(state="normal")
+                    if then:
+                        then(result)
+                window.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def add_input(row, label, var, hint, extensions, on_change=None):
         ttk.Label(inputs_group, text=label, font=(UI_FONT, 10, "bold")).grid(row=row * 2, column=0, sticky="w", pady=(4, 0))
@@ -280,7 +307,7 @@ def main(smoke_test: bool = False):
             entry.bind("<FocusOut>", lambda _e: on_change())
         return entry
 
-    script_entry = add_input(0, "Script", script_var, "Google Doc link (must be viewable by anyone with the link) or a .docx file.", "*.docx", resolve_script)
+    script_entry = add_input(0, "Script", script_var, "Google Doc link (must be viewable by anyone with the link) or a .docx file.", "*.docx", resolve_script_async)
     audio_entry = add_input(1, "Voiceover", audio_var, "Drop an audio file here, paste a Google Drive link, or browse.", "*.mp3 *.wav *.m4a *.aac *.flac")
     ttk.Label(inputs_group, textvariable=inspect_status, wraplength=780, justify="left").grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
@@ -289,7 +316,7 @@ def main(smoke_test: bool = False):
             ext = Path(raw).suffix.lower()
             if ext == ".docx":
                 script_var.set(raw)
-                resolve_script()
+                resolve_script_async()
             elif ext in AUDIO_EXT:
                 audio_var.set(raw)
         return event.action
@@ -319,35 +346,43 @@ def main(smoke_test: bool = False):
             messagebox.showerror("Could not open", str(error))
 
     def launch():
-        try:
-            docx = resolve_script(quiet=False)
-            if not docx:
-                raise ValueError("Choose a script first (.docx or Google Doc link).")
-            audio = audio_var.get().strip()
-            if not audio or not (is_drive_url(audio) or Path(audio).is_file()):
-                raise ValueError("Choose the voiceover: drop an audio file or paste a Google Drive link.")
-            width, height = int(settings_vars["width"].get()), int(settings_vars["height"].get())
-            limit_minutes, buffer_minutes = float(settings_vars["limit_minutes"].get()), float(settings_vars["buffer_minutes"].get())
-            if width <= 0 or height <= 0:
-                raise ValueError("Width and height must be positive numbers.")
-            if not 1 <= limit_minutes <= 1440 or not 0 <= buffer_minutes <= 60:
-                raise ValueError("Use a limit of 1–1440 minutes and handles of 0–60 minutes.")
-            config = {
-                "docx": docx, "audio": audio, "title": Path(docx).stem,
-                "projects_dir": str(projects_dir({"projects_dir": settings_vars["projects_dir"].get().strip()})),
-                "media_dir": settings_vars["media_dir"].get().strip(),
-                "videos": settings_vars["videos"].get(), "limit_minutes": limit_minutes, "buffer_minutes": buffer_minutes,
-                "width": width, "height": height, "preset": settings_vars["preset"].get(),
-                "whisper_model": settings_vars["whisper_model"].get().strip() or "small.en",
-                "device": settings_vars["device"].get(),
-                "models_dir": settings_vars["models_dir"].get().strip(),
-            }
-            folder = start_job(config)
-            selected[0] = str(folder)
-            refresh()
-        except Exception as error:
-            traceback.print_exc()
-            messagebox.showerror("Cannot start run", str(error))
+        # resolve_script_async does the (network) Google Doc download off the UI thread so a
+        # slow/unreachable link can't freeze the window; finish_launch runs back on the UI thread.
+        build_btn.configure(state="disabled")
+
+        def finish_launch(docx):
+            try:
+                if not docx:
+                    raise ValueError("Choose a script first (.docx or Google Doc link).")
+                audio = audio_var.get().strip()
+                if not audio or not (is_drive_url(audio) or Path(audio).is_file()):
+                    raise ValueError("Choose the voiceover: drop an audio file or paste a Google Drive link.")
+                width, height = int(settings_vars["width"].get()), int(settings_vars["height"].get())
+                limit_minutes, buffer_minutes = float(settings_vars["limit_minutes"].get()), float(settings_vars["buffer_minutes"].get())
+                if width <= 0 or height <= 0:
+                    raise ValueError("Width and height must be positive numbers.")
+                if not 1 <= limit_minutes <= 1440 or not 0 <= buffer_minutes <= 60:
+                    raise ValueError("Use a limit of 1–1440 minutes and handles of 0–60 minutes.")
+                config = {
+                    "docx": docx, "audio": audio, "title": Path(docx).stem,
+                    "projects_dir": str(projects_dir({"projects_dir": settings_vars["projects_dir"].get().strip()})),
+                    "media_dir": settings_vars["media_dir"].get().strip(),
+                    "videos": settings_vars["videos"].get(), "limit_minutes": limit_minutes, "buffer_minutes": buffer_minutes,
+                    "width": width, "height": height, "preset": settings_vars["preset"].get(),
+                    "whisper_model": settings_vars["whisper_model"].get().strip() or "small.en",
+                    "device": settings_vars["device"].get(),
+                    "models_dir": settings_vars["models_dir"].get().strip(),
+                }
+                folder = start_job(config)
+                selected[0] = str(folder)
+                refresh()
+            except Exception as error:
+                traceback.print_exc()
+                messagebox.showerror("Cannot start run", str(error))
+            finally:
+                build_btn.configure(state="normal")
+
+        resolve_script_async(quiet=False, then=finish_launch)
 
     build_btn = ttk.Button(build_frame, text="⚡  Build Skeleton", command=launch, padding=(14, 7))
     build_btn.pack(side="left")
