@@ -32,6 +32,20 @@ def cache_dir() -> Path:
     return user_data_dir() if FROZEN else ROOT / ".cache"
 
 
+def app_dir() -> Path:
+    """Directory the app lives in: sibling of the .exe on Windows (next to its "_internal"
+    folder), sibling of the .app bundle on macOS, or the project root when run from source.
+    The default Projects/Media/Models folders are created here."""
+    if not FROZEN:
+        return ROOT
+    exe = Path(sys.executable).resolve()
+    if sys.platform == "darwin":
+        for ancestor in exe.parents:
+            if ancestor.suffix == ".app":
+                return ancestor.parent
+    return exe.parent
+
+
 def ffmpeg_exe() -> str:
     """ffmpeg bundled with the app (imageio-ffmpeg), else the one on PATH."""
     try:

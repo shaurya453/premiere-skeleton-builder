@@ -3,11 +3,12 @@ import datetime
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import uuid
 
-from paths import FROZEN, ROOT, cache_dir
+from paths import FROZEN, ROOT, app_dir, cache_dir
 
 SETTINGS = cache_dir() / 'desktop-settings.json'
 
@@ -71,23 +72,12 @@ def inspect_run(folder):
     return {**state, 'folder': str(folder), 'result': str(result), 'display_status': status}
 
 
-def documents_dir():
-    """The user's Documents folder (follows OneDrive redirection on Windows)."""
-    if os.name == 'nt':
-        try:
-            import ctypes
-            buf = ctypes.create_unicode_buffer(260)
-            if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0 and buf.value:  # CSIDL_PERSONAL
-                return Path(buf.value)
-        except Exception:
-            pass
-    return Path.home() / 'Documents'
-
-
-DEFAULT_HOME = documents_dir() / 'Premiere Skeleton Builder'
-DEFAULT_PROJECTS = DEFAULT_HOME / 'Projects'
-DEFAULT_MEDIA = DEFAULT_HOME / 'Media'
-DEFAULT_MODELS = DEFAULT_HOME / 'Models'  # speech-recognition model files (downloaded on first use)
+# Self-contained by default: Projects/Media/Models live next to the app itself
+# (the .exe and its "_internal" folder on Windows, or the .app bundle on macOS),
+# not tucked away in the user's Documents folder. Configurable in Paths & Options.
+DEFAULT_PROJECTS = app_dir() / 'Projects'
+DEFAULT_MEDIA = app_dir() / 'Media'
+DEFAULT_MODELS = app_dir() / 'Models'  # speech-recognition model files (downloaded on first use)
 
 
 def projects_dir(settings=None):
@@ -116,6 +106,36 @@ def unique_folder(root, title):
     while folder.exists():
         folder, n = root/f'{base} ({n})', n + 1
     return folder
+
+
+def transfer_folder_contents(old_dir, new_dir):
+    """Move everything from old_dir into new_dir (merging same-named sub-folders one level
+    deep). Used when the user points a Locations setting at a new folder. Returns a list of
+    per-item error strings; an empty list means everything moved cleanly."""
+    old_dir, new_dir = Path(old_dir), Path(new_dir)
+    if not old_dir.is_dir() or old_dir.resolve() == new_dir.resolve():
+        return []
+    new_dir.mkdir(parents=True, exist_ok=True)
+    errors = []
+    for item in list(old_dir.iterdir()):
+        target = new_dir / item.name
+        try:
+            if target.exists():
+                if target.is_dir() and item.is_dir():
+                    for sub in list(item.iterdir()):
+                        shutil.move(str(sub), str(target / sub.name))
+                    item.rmdir()
+                else:
+                    errors.append(f'{item.name}: already exists at the destination, left in place')
+            else:
+                shutil.move(str(item), str(target))
+        except OSError as error:
+            errors.append(f'{item.name}: {error}')
+    try:
+        old_dir.rmdir()  # only succeeds if now empty
+    except OSError:
+        pass
+    return errors
 
 
 def run_layout(folder, media_root=None):

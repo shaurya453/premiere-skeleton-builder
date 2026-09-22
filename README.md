@@ -10,11 +10,19 @@ Open **Open Skeleton Builder.cmd** (Windows) or **Skeleton Builder.app** (Mac), 
 2. **Build**: paste the Google Doc link, drop the voiceover (or paste a Google Drive link), click **Build Skeleton**.
 3. **Run Premiere Pro with Skeleton** opens the finished timeline in Premiere.
 
+By default, `Projects`, `Media` and `Models` folders are created next to the app itself
+(alongside `SkeletonBuilder.exe`/`Premiere Skeleton Builder.app`, or the project root when
+run from source) — nothing is written to Documents unless you point a location there yourself.
+Changing a location in **Paths & Options** offers to move the existing files across; runs are
+picked up from wherever `Projects folder` currently points.
+
 Each run creates `<projects folder>/<Google Doc title>/` with `Script/`, `Audio/`,
 `Timeline/` (the XML files), `Media/` (images and downloaded videos, or
 `<media folder>/<title>/` when a media folder is set), plus `run.json` and `run.log`.
 Runs continue independently when the window is closed; reopen the app to see progress.
 Download and speech caches are reused. Keep the computer awake while processing.
+If a run fails (e.g. a network hiccup while fetching the script or voiceover), select it in
+**Runs** and use **Retry script & audio fetch** to try again with the same inputs.
 
 ## Packaged apps (no Python needed)
 

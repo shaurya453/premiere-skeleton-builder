@@ -18,7 +18,8 @@ try:
 except Exception:  # drag and drop is optional
     DND_FILES = TkinterDnD = None
 
-from jobs import ROOT, SETTINGS, DEFAULT_PROJECTS, DEFAULT_MEDIA, DEFAULT_MODELS, read_json, write_json, runs, start_job, projects_dir
+from jobs import (ROOT, SETTINGS, DEFAULT_PROJECTS, DEFAULT_MEDIA, DEFAULT_MODELS, read_json, write_json,
+                   runs, start_job, projects_dir, transfer_folder_contents)
 from skeleton_builder import inspect_docx
 from google_docs import is_google_doc_url, download_google_doc
 from drive_audio import is_drive_url
@@ -153,11 +154,61 @@ def main(smoke_test: bool = False):
             pass
     save_settings()
 
-    def pick_folder(var, title):
+    # Folders whose contents can be offered a move when the user points them somewhere new
+    # (Projects/Media/Models). The Premiere program path is not one of these.
+    FOLDER_LABELS = {"projects_dir": "projects", "media_dir": "media", "models_dir": "speech model"}
+    committed_locations = {key: settings_vars[key].get().strip() for key in FOLDER_LABELS}
+
+    def offer_transfer(key, old, new):
+        """Ask whether to move existing files from the old folder to the new one. Returns
+        True to accept the new location (with or without moving files), False to keep the old one."""
+        label = FOLDER_LABELS[key]
+        has_contents = Path(old).is_dir() and any(Path(old).iterdir())
+        if not has_contents:
+            return True
+        choice = messagebox.askyesnocancel(
+            "Move existing files?",
+            f"You changed the {label} folder:\n\nFrom: {old}\nTo: {new}\n\n"
+            f"Move the existing {label} files there now?\n\n"
+            "Yes — move them into the new folder.\n"
+            "No — leave them where they are and start fresh at the new folder.\n"
+            "Cancel — keep using the previous folder.\n\n"
+            "Note: runs already built keep the file paths they were built with, so a "
+            "finished Premiere timeline may need re-linking in Premiere if its media moves."
+        )
+        if choice is None:
+            settings_vars[key].set(old)
+            return False
+        if choice:
+            errors = transfer_folder_contents(old, new)
+            if errors:
+                messagebox.showwarning("Some items were not moved",
+                                        "\n".join(errors[:10]) + ("\n…" if len(errors) > 10 else ""))
+        return True
+
+    def commit_location(key):
+        def handler(_e=None):
+            new = settings_vars[key].get().strip()
+            old = committed_locations[key]
+            if not new or new == old:
+                return
+            try:
+                Path(new).mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                messagebox.showerror("Cannot use that folder", str(error))
+                settings_vars[key].set(old)
+                return
+            if offer_transfer(key, old, new):
+                committed_locations[key] = new
+                refresh()  # the Runs list re-scans the (possibly new) projects folder
+        return handler
+
+    def pick_folder(key, title):
         def choose_folder():
-            path = filedialog.askdirectory(title=title, initialdir=var.get() or str(ROOT))
+            path = filedialog.askdirectory(title=title, initialdir=settings_vars[key].get() or str(ROOT))
             if path:
-                var.set(path)
+                settings_vars[key].set(path)
+                commit_location(key)()
         return choose_folder
 
     def pick_program():
@@ -170,18 +221,22 @@ def main(smoke_test: bool = False):
     paths_group.pack(fill="x")
     paths_group.columnconfigure(1, weight=1)
     location_rows = [
-        ("Projects folder", "projects_dir", pick_folder(settings_vars["projects_dir"], "Choose projects folder"),
+        ("Projects folder", "projects_dir", pick_folder("projects_dir", "Choose projects folder"),
          "Each run gets its own sub-folder here. Created automatically if missing."),
-        ("Media download folder", "media_dir", pick_folder(settings_vars["media_dir"], "Choose media download folder"),
+        ("Media download folder", "media_dir", pick_folder("media_dir", "Choose media download folder"),
          "Images and downloaded video clips, one sub-folder per run. Created automatically if missing."),
-        ("Speech model folder", "models_dir", pick_folder(settings_vars["models_dir"], "Choose speech model folder"),
+        ("Speech model folder", "models_dir", pick_folder("models_dir", "Choose speech model folder"),
          "faster-whisper downloads the chosen model here the first time it is used (0.5–1.6 GB), then reuses it."),
         ("Premiere Pro program", "premiere_exe", pick_program,
          "Used by 'Run Premiere Pro with Skeleton'. Detected automatically when possible."),
     ]
     for r, (label, key, command, hint) in enumerate(location_rows):
         ttk.Label(paths_group, text=label, font=(UI_FONT, 10, "bold")).grid(row=r * 2, column=0, sticky="w", pady=(6, 0))
-        ttk.Entry(paths_group, textvariable=settings_vars[key]).grid(row=r * 2, column=1, sticky="ew", padx=8, pady=(6, 0))
+        entry = ttk.Entry(paths_group, textvariable=settings_vars[key])
+        entry.grid(row=r * 2, column=1, sticky="ew", padx=8, pady=(6, 0))
+        if key in FOLDER_LABELS:
+            entry.bind("<Return>", commit_location(key))
+            entry.bind("<FocusOut>", commit_location(key))
         ttk.Button(paths_group, text="Browse…", command=command).grid(row=r * 2, column=2, pady=(6, 0))
         ttk.Label(paths_group, text=hint, foreground=MUTED, font=(UI_FONT, 9)).grid(row=r * 2 + 1, column=1, sticky="w", padx=8)
 
@@ -235,13 +290,15 @@ def main(smoke_test: bool = False):
 
     resolving = [False]
 
-    def resolve_script(quiet=True):
+    def resolve_script(source=None, quiet=True, update_var=True):
         """Download a Google Doc link (if given), then check the script. Returns the local path or None.
 
-        Blocking: does network I/O. Only call this off the UI thread (see resolve_script_async),
-        except from launch(), which already runs inside its own background thread.
+        Blocking: does network I/O. Only call this off the UI thread (see resolve_script_async).
+        `source` defaults to the Script field's value; pass it explicitly (e.g. to retry a past
+        run's original link) without touching the Build tab's own field by also passing
+        update_var=False.
         """
-        value = script_var.get().strip()
+        value = (source if source is not None else script_var.get()).strip()
         if not value:
             return None
         if is_google_doc_url(value):
@@ -253,7 +310,8 @@ def main(smoke_test: bool = False):
                 if not quiet:
                     window.after(0, lambda: messagebox.showerror("Google Doc Error", str(err)))
                 return None
-            window.after(0, lambda: script_var.set(value))
+            if update_var:
+                window.after(0, lambda: script_var.set(value))
         if not Path(value).is_file():
             status(f"❌ Script file not found: {value}")
             return None
@@ -267,7 +325,7 @@ def main(smoke_test: bool = False):
         status(note)
         return value
 
-    def resolve_script_async(quiet=True, then=None):
+    def resolve_script_async(source=None, quiet=True, then=None, update_var=True):
         """Non-blocking wrapper: runs resolve_script() off the UI thread so a Google Doc
         download (or a slow/unreachable link) never freezes the window."""
         if resolving[0]:
@@ -277,7 +335,7 @@ def main(smoke_test: bool = False):
 
         def worker():
             try:
-                result = resolve_script(quiet=quiet)
+                result = resolve_script(source=source, quiet=quiet, update_var=update_var)
             finally:
                 def done():
                     resolving[0] = False
@@ -364,7 +422,7 @@ def main(smoke_test: bool = False):
                 if not 1 <= limit_minutes <= 1440 or not 0 <= buffer_minutes <= 60:
                     raise ValueError("Use a limit of 1–1440 minutes and handles of 0–60 minutes.")
                 config = {
-                    "docx": docx, "audio": audio, "title": Path(docx).stem,
+                    "docx": docx, "docx_source": script_var.get().strip(), "audio": audio, "title": Path(docx).stem,
                     "projects_dir": str(projects_dir({"projects_dir": settings_vars["projects_dir"].get().strip()})),
                     "media_dir": settings_vars["media_dir"].get().strip(),
                     "videos": settings_vars["videos"].get(), "limit_minutes": limit_minutes, "buffer_minutes": buffer_minutes,
@@ -421,11 +479,40 @@ def main(smoke_test: bool = False):
         if run:
             open_path(run["folder"])
 
+    def retry_run():
+        run = chosen_run()
+        cfg = dict((run or {}).get("config") or {})
+        if not cfg:
+            messagebox.showwarning("Cannot retry", "This run has no saved configuration to retry.")
+            return
+        retry_btn.configure(state="disabled")
+        source = cfg.get("docx_source") or cfg.get("docx")
+
+        def after_resolve(docx_path):
+            try:
+                if not docx_path:
+                    raise ValueError("Could not fetch the script again — see the status message above.")
+                folder = start_job({**cfg, "docx": docx_path})
+                selected[0] = str(folder)
+                refresh()
+            except Exception as error:
+                traceback.print_exc()
+                messagebox.showerror("Cannot retry run", str(error))
+            finally:
+                retry_btn.configure(state="normal")
+
+        # Re-downloads the script (if it was a Google Doc link) and, via start_job below,
+        # re-stages the voiceover too (re-downloads it if it was a Google Drive link) —
+        # without touching whatever the Build tab currently has typed in.
+        resolve_script_async(source=source, quiet=False, then=after_resolve, update_var=False)
+
     button_row = ttk.Frame(result_group)
     button_row.pack(fill="x")
     premiere_btn = ttk.Button(button_row, text="▶  Run Premiere Pro with Skeleton", command=run_premiere, padding=(10, 5))
     premiere_btn.pack(side="left", padx=(0, 8))
-    ttk.Button(button_row, text="Open project folder", command=open_project, padding=(10, 5)).pack(side="left")
+    ttk.Button(button_row, text="Open project folder", command=open_project, padding=(10, 5)).pack(side="left", padx=(0, 8))
+    retry_btn = ttk.Button(button_row, text="⟳  Retry script & audio fetch", command=retry_run, padding=(10, 5))
+    retry_btn.pack(side="left")
 
     # ---------------- Runs tab ----------------
     tree = ttk.Treeview(runs_tab, columns=("status", "date"), height=6)
@@ -481,7 +568,7 @@ def main(smoke_test: bool = False):
                 tree.insert("", "end", iid=r["folder"], **args)
 
         running = any(r["display_status"] in ("Running", "Starting") for r in current)
-        build_btn.configure(state="disabled" if running else "normal")
+        build_btn.configure(state="disabled" if (running or resolving[0]) else "normal")
         if not selected[0] and current:
             selected[0] = next((r["folder"] for r in current if r["display_status"] == "Running"), current[0]["folder"])
         if selected[0] and tree.exists(selected[0]) and tree.selection() != (selected[0],):
@@ -489,6 +576,9 @@ def main(smoke_test: bool = False):
 
         r = known.get(selected[0])
         premiere_btn.configure(state="normal" if skeleton_xml(r) else "disabled")
+        retry_status = ("Failed — see log", "Interrupted / incomplete")
+        can_retry = bool(r) and not running and not resolving[0] and r["display_status"] in retry_status and r.get("config")
+        retry_btn.configure(state="normal" if can_retry else "disabled")
         if not r:
             return
         log_path = Path(r["folder"]) / "run.log"

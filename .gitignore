@@ -25,3 +25,8 @@ dist/
 build/
 *.spec
 startup_err.log
+
+# Default Projects/Media/Models folders when run from source (app_dir() == repo root)
+/Projects/
+/Media/
+/Models/
