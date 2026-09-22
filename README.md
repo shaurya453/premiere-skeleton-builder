@@ -23,7 +23,8 @@ Download the zip for your computer from the GitHub **Actions** tab (workflow "Bu
 - **Windows:** unzip, run `SkeletonBuilder.exe` (keep it inside its folder).
 - **macOS:** unzip, drag `Premiere Skeleton Builder.app` to Applications. It is not signed, so the
   first time use right-click > Open (or `xattr -cr "/Applications/Premiere Skeleton Builder.app"`).
-  Use the Apple Silicon build on M-series Macs and the Intel build on older Macs.
+  One build covers both Apple Silicon and Intel Macs; on an Intel Mac it runs under Rosetta 2
+  (macOS installs this automatically the first time it's needed).
 
 They include FFmpeg, speech recognition and the YouTube/web downloaders. The speech model
 (0.5 GB for the default) downloads on first use into the Speech model folder. On Windows with an
