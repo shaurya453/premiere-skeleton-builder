@@ -14,11 +14,16 @@ Open **Open Skeleton Builder.cmd** (Windows) or **Skeleton Builder.app** (Mac), 
    **Queue** and starts automatically as soon as the current one finishes — submit several
    in a row without waiting. The first-run speech model download shows live progress
    ("Downloading speech model — 42% (320 MB / 760 MB)") instead of sitting silently.
+   **Stop** cancels whichever run is currently active — there's no undo, but partial
+   output stays on disk.
 4. **Run Premiere Pro with Skeleton** opens the finished timeline in Premiere.
 
-By default, `Projects`, `Media` and `Models` folders are created next to the app itself
-(alongside `SkeletonBuilder.exe`/`Premiere Skeleton Builder.app`, or the project root when
-run from source) — nothing is written to Documents unless you point a location there yourself.
+By default, `Projects`, `Media`, `Models` and `Cache` folders are created next to the app
+itself (alongside `SkeletonBuilder.exe`/`Premiere Skeleton Builder.app`, or the project root
+when run from source) — nothing is written to Documents unless you point a location there
+yourself. `Cache` holds regenerable working data (a script pasted as a Google Doc link,
+cue-preview images, cached YouTube sources); only small app state (settings, the build
+queue) stays in the OS profile folder mentioned below.
 Changing a location in **Paths & Options** offers to move the existing files across; runs are
 picked up from wherever `Projects folder` currently points.
 
@@ -41,6 +46,11 @@ Download the zip for your computer from the GitHub **Actions** tab (workflow "Bu
   first time use right-click > Open (or `xattr -cr "/Applications/Premiere Skeleton Builder.app"`).
   One build covers both Apple Silicon and Intel Macs; on an Intel Mac it runs under Rosetta 2
   (macOS installs this automatically the first time it's needed).
+  Actually drag the `.app` into `/Applications` with Finder before opening it — launching it
+  straight from the unzipped Downloads folder can trigger macOS "App Translocation", which runs
+  it from a randomized read-only path and can throw a "read only" error on first launch. The
+  app now falls back to a writable folder automatically if this happens, but moving it to
+  Applications first avoids it entirely.
 
 They include FFmpeg, speech recognition and the YouTube/web downloaders. The speech model
 (0.5 GB for the default) downloads on first use into the Speech model folder. On Windows with an

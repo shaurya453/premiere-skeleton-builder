@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from paths import NO_WINDOW, cache_dir, ffmpeg_exe, node_exe
+from paths import NO_WINDOW, ffmpeg_exe, local_cache_dir, node_exe
 from web_media import identify_source, download_direct_video
 
 FPS = 30000 / 1001
@@ -149,7 +149,7 @@ def prepare_sources(cues, output, handles=600, full=None, cache=None, full_limit
     """One cached download and one editable source window per distinct video source."""
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    cache = Path(cache or cache_dir()/"youtube")
+    cache = Path(cache or local_cache_dir()/"youtube")
     groups, failures, sources = {}, [], {}
     for cue in cues:
         if cue["kind"] != "video" or cue["start"] is None:

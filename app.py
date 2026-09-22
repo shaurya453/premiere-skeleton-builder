@@ -19,7 +19,7 @@ except Exception:  # drag and drop is optional
     DND_FILES = TkinterDnD = None
 
 from jobs import (ROOT, SETTINGS, DEFAULT_PROJECTS, DEFAULT_MEDIA, DEFAULT_MODELS, read_json, write_json,
-                   runs, start_job, projects_dir, transfer_folder_contents,
+                   runs, start_job, stop_job, projects_dir, transfer_folder_contents,
                    read_queue, enqueue, dequeue_next, remove_from_queue)
 from skeleton_builder import inspect_docx, preview_cues
 from google_docs import is_google_doc_url, download_google_doc
@@ -508,6 +508,20 @@ def main(smoke_test: bool = False):
     build_btn.pack(side="left")
     preview_btn = ttk.Button(build_frame, text="👁  Preview cues", command=preview, padding=(10, 7))
     preview_btn.pack(side="left", padx=(8, 0))
+
+    def stop_current_run():
+        active = next((r for r in runs(settings_vars["projects_dir"].get().strip() or None)
+                       if r["display_status"] in ("Running", "Starting")), None)
+        if not active:
+            return
+        if messagebox.askyesno("Stop build?",
+                               f'Stop "{Path(active["folder"]).name}"? Partial output stays on disk, '
+                               'but this run cannot be resumed — you would need to retry it.'):
+            stop_job(active["folder"])
+            refresh()
+
+    stop_btn = ttk.Button(build_frame, text="⏹  Stop", command=stop_current_run, padding=(10, 7))
+    stop_btn.pack(side="left", padx=(8, 0))
     phase_label.pack(side="left", padx=14)
     progress_bar.pack(side="right", fill="x", expand=True)
 
@@ -685,6 +699,7 @@ def main(smoke_test: bool = False):
         # automatically once the current one finishes (see the queue-advance above).
         build_btn.configure(state="disabled" if resolving[0] else "normal")
         preview_btn.configure(state="disabled" if resolving[0] else "normal")
+        stop_btn.configure(state="normal" if running else "disabled")
         if not selected[0] and current:
             selected[0] = next((r["folder"] for r in current if r["display_status"] == "Running"), current[0]["folder"])
         if selected[0] and tree.exists(selected[0]) and tree.selection() != (selected[0],):

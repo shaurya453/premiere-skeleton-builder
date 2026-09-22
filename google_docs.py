@@ -155,8 +155,8 @@ def download_google_doc(
 
     # Determine destination folder
     if destination_dir is None:
-        from paths import cache_dir
-        destination_dir = cache_dir() / "inputs"
+        from paths import local_cache_dir
+        destination_dir = local_cache_dir() / "inputs"
     dest_path = Path(destination_dir)
     dest_path.mkdir(parents=True, exist_ok=True)
 

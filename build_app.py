@@ -31,6 +31,7 @@ def main():
         "--collect-all", "tkinterdnd2", "--collect-all", "imageio_ffmpeg",
         "--collect-all", "yt_dlp", "--collect-all", "yt_dlp_ejs",
         "--collect-submodules", "av",
+        "--collect-data", "certifi",  # cacert.pem: macOS frozen builds need this for HTTPS to verify at all
         "--hidden-import", "web_media", "--hidden-import", "drive_audio", "--hidden-import", "transcribe_words",
         "--hidden-import", "job_worker", "--hidden-import", "skeleton_builder", "--hidden-import", "app",
         "--exclude-module", "torch", "--exclude-module", "matplotlib", "--exclude-module", "IPython",

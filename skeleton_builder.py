@@ -26,7 +26,7 @@ from lxml import etree as ET
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from google_docs import is_google_doc_url, download_google_doc
-from paths import NO_WINDOW, cache_dir, ffmpeg_exe
+from paths import NO_WINDOW, cache_dir, ffmpeg_exe, local_cache_dir
 
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
       "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
@@ -263,10 +263,11 @@ def preview_cues(path):
     local .docx file (resolve a Google Doc link first). Returns (cues, warnings) where each
     cue is {kind, passage, targets, asset_path}; asset_path is set only for embedded images
     (extracted directly from the docx, so no network access is needed to know their path).
-    Embedded images are cached under cache_dir()/preview/<doc hash> so the returned paths
-    stay valid after this call returns (unlike a temp directory, which would be deleted)."""
+    Embedded images are cached under local_cache_dir()/preview/<doc hash> so the returned
+    paths stay valid after this call returns (unlike a temp directory, which would be
+    deleted)."""
     path = Path(path)
-    assets_dir = cache_dir() / "preview" / hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:16]
+    assets_dir = local_cache_dir() / "preview" / hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:16]
     _, cues, _, warnings = read_docx(path, assets_dir, fetch_web=False)
     preview = [{
         "kind": cue["kind"],

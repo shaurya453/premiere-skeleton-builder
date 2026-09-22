@@ -8,7 +8,7 @@ import subprocess
 import sys
 import uuid
 
-from paths import FROZEN, ROOT, app_dir, cache_dir
+from paths import FROZEN, ROOT, cache_dir, default_data_root
 
 SETTINGS = cache_dir() / 'desktop-settings.json'
 
@@ -75,9 +75,9 @@ def inspect_run(folder):
 # Self-contained by default: Projects/Media/Models live next to the app itself
 # (the .exe and its "_internal" folder on Windows, or the .app bundle on macOS),
 # not tucked away in the user's Documents folder. Configurable in Paths & Options.
-DEFAULT_PROJECTS = app_dir() / 'Projects'
-DEFAULT_MEDIA = app_dir() / 'Media'
-DEFAULT_MODELS = app_dir() / 'Models'  # speech-recognition model files (downloaded on first use)
+DEFAULT_PROJECTS = default_data_root() / 'Projects'
+DEFAULT_MEDIA = default_data_root() / 'Media'
+DEFAULT_MODELS = default_data_root() / 'Models'  # speech-recognition model files (downloaded on first use)
 
 
 def projects_dir(settings=None):
@@ -171,6 +171,28 @@ def dequeue_next():
 
 def remove_from_queue(entry_id):
     write_queue([i for i in read_queue() if i['id'] != entry_id])
+
+
+def stop_job(folder):
+    """Kill a running job's whole process tree (the detached supervisor and the builder
+    subprocess it spawned) and mark the run failed so it stops showing as active. There
+    is no graceful cancellation point inside the pipeline, so this is an immediate kill,
+    not a request the job can decline."""
+    folder = Path(folder)
+    state = read_json(folder / 'run.json')
+    pid = state.get('pid')
+    if pid and alive(pid):
+        try:
+            if os.name == 'nt':
+                subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True)
+            else:
+                import signal
+                os.killpg(int(pid), signal.SIGKILL)  # job_worker runs start_new_session=True,
+                                                       # so its pid is also its process group id
+        except OSError:
+            pass
+    state.update(status='failed', error='Stopped by user')
+    write_json(folder / 'run.json', state)
 
 
 def run_layout(folder, media_root=None):

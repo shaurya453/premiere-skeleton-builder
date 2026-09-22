@@ -5,3 +5,4 @@ yt-dlp[default]==2026.8.19
 tkinterdnd2
 imageio-ffmpeg
 av
+certifi
