@@ -8,7 +8,7 @@ import subprocess
 import sys
 import uuid
 
-from paths import FROZEN, ROOT, cache_dir, default_data_root
+from paths import FROZEN, NO_WINDOW, ROOT, cache_dir, default_data_root
 
 SETTINGS = cache_dir() / 'desktop-settings.json'
 
@@ -184,7 +184,7 @@ def stop_job(folder):
     if pid and alive(pid):
         try:
             if os.name == 'nt':
-                subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True)
+                subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True, **NO_WINDOW)
             else:
                 import signal
                 os.killpg(int(pid), signal.SIGKILL)  # job_worker runs start_new_session=True,

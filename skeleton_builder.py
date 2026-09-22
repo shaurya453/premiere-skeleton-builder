@@ -113,6 +113,7 @@ def read_docx(path, assets_dir, fetch_web=True):
     """Read bookmarks in document order, including body-level bookmark nodes."""
     assets_dir.mkdir(parents=True, exist_ok=True)
     web_fetch = (lambda url: __import__('web_media').fetch_image(url, assets_dir)) if fetch_web else None
+    warnings = []
     with ZipFile(path) as archive:
         root = ET.fromstring(archive.read("word/document.xml"))
         relationships = {e.get("Id"): e.get("Target") for e in
@@ -126,18 +127,25 @@ def read_docx(path, assets_dir, fetch_web=True):
                 if not relation:
                     continue
                 archive_path = "word/" + relation
-                data = archive.read(archive_path)
-                filename = f"asset_{len(embedded)+1:02d}" + Path(relation).suffix.lower()
-                target = assets_dir / filename
-                target.write_bytes(data)
-                with Image.open(target) as image:
-                    width, height = image.size
-                asset = {"path": str(target.resolve()), "width": width, "height": height,
-                         "bookmarks": list(pending), "source_part": archive_path,
-                         "sha256": hashlib.sha256(data).hexdigest()}
-                embedded.append(asset)
-                for name in pending:
-                    bookmark_images[name] = asset
+                try:
+                    data = archive.read(archive_path)
+                    filename = f"asset_{len(embedded)+1:02d}" + Path(relation).suffix.lower()
+                    target = assets_dir / filename
+                    target.write_bytes(data)
+                    with Image.open(target) as image:
+                        image.load()
+                        width, height = image.size
+                    asset = {"path": str(target.resolve()), "width": width, "height": height,
+                             "bookmarks": list(pending), "source_part": archive_path,
+                             "sha256": hashlib.sha256(data).hexdigest()}
+                    embedded.append(asset)
+                    for name in pending:
+                        bookmark_images[name] = asset
+                except Exception as error:
+                    # A format PIL can't open (e.g. an embedded WMF/EMF) shouldn't sink the
+                    # whole build; skip this one picture and let the normal "Missing
+                    # bookmark/image" warning below cover its cue instead.
+                    warnings.append(f"Skipped unreadable embedded image {archive_path}: {error}")
                 pending = []
 
         paragraphs = []
@@ -160,7 +168,7 @@ def read_docx(path, assets_dir, fetch_web=True):
             if text.strip():
                 paragraphs.append({"text": text, "links": links})
 
-    all_script_tokens, cues, warnings = [], [], []
+    all_script_tokens, cues = [], []
     for paragraph in paragraphs:
         raw = paragraph["text"]
         clean = list(raw)
@@ -290,7 +298,11 @@ def timed_tokens(words_path, audio):
     """Load per-word timings produced by local ASR for exactly this audio file."""
     if not words_path:
         raise ValueError("Word timings are required; run speech recognition on the voiceover first.")
-    data = json.loads(Path(words_path).read_text(encoding="utf-8"))
+    try:
+        data = json.loads(Path(words_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise ValueError(f"Word timing cache at {words_path} is missing or corrupted ({error}); "
+                          "delete it and rebuild.") from error
     if data.get("audio_sha256") != hashlib.sha256(Path(audio).read_bytes()).hexdigest():
         raise ValueError("Word timing cache belongs to a different audio file.")
     fine = []

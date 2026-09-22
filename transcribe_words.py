@@ -93,8 +93,11 @@ def transcribe(audio, destination, model_name="small.en", device="auto", models_
     audio, destination = Path(audio), Path(destination)
     digest = hashlib.sha256(audio.read_bytes()).hexdigest()
     if destination.exists():
-        cached = json.loads(destination.read_text(encoding="utf-8"))
-        if cached.get("audio_sha256") == digest and cached.get("model") == model_name:
+        try:
+            cached = json.loads(destination.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            cached = None  # missing or corrupted (e.g. a killed run mid-write); re-transcribe
+        if cached and cached.get("audio_sha256") == digest and cached.get("model") == model_name:
             print("Using cached word timings.", flush=True)
             return cached
     os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
@@ -133,7 +136,11 @@ def transcribe(audio, destination, model_name="small.en", device="auto", models_
     result = {"audio_sha256": digest, "model": model_name, "duration": info.duration,
               "method": "local ASR word timestamps; review approximate boundaries", "words": words}
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    # Write atomically so a killed/crashed run (e.g. via Stop) can never leave a half-written,
+    # corrupted cache file behind for the next run to trip over.
+    tmp = destination.with_name(destination.name + ".tmp")
+    tmp.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(destination)
     return result
 
 

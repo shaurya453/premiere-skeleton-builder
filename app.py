@@ -750,9 +750,17 @@ def main(smoke_test: bool = False):
 
     def poll():
         try:
+            if not window.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
             refresh()
         except Exception as error:
-            current_var.set(f"Status refresh error: {error}")
+            try:
+                current_var.set(f"Status refresh error: {error}")
+            except tk.TclError:
+                return
         window.after(1500, poll)
 
     def close():

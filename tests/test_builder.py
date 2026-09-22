@@ -58,6 +58,28 @@ class BookmarkTests(unittest.TestCase):
             self.assertEqual(preview[0]["passage"], "They found the book")
             self.assertTrue(Path(preview[0]["asset_path"]).is_file())
 
+    def test_unreadable_embedded_image_is_skipped_not_fatal(self):
+        # A corrupt/unsupported embedded picture (e.g. a WMF/EMF Word sometimes embeds)
+        # should not sink the whole doc parse; it's reported as a warning and skipped.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            doc = '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+                     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body>
+                     <w:p><w:r><w:t>They found the book. (</w:t></w:r><w:hyperlink w:anchor="broken"><w:r><w:t>IMG 1</w:t></w:r></w:hyperlink><w:r><w:t>)</w:t></w:r></w:p>
+                     <w:bookmarkStart w:id="1" w:name="broken"/><w:p><a:blip r:embed="a1"/></w:p>
+                     </w:body></w:document>'''
+            rels = '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="a1" Target="media/image1.wmf"/></Relationships>'''
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+                z.writestr("word/media/image1.wmf", b"not actually an image")
+            words, cues, assets, warnings = read_docx(root / "script.docx", root / "assets")
+            self.assertEqual(assets, [])
+            self.assertTrue(any("Skipped unreadable embedded image" in w for w in warnings))
+            self.assertTrue(any("Missing bookmark/image" in w for w in warnings))
+
     def test_wrong_audio_cache_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

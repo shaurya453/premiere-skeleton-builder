@@ -77,7 +77,12 @@ def probe(path):
         video = next((s for s in container.streams if s.type == "video"), None)
         if video is None:
             raise ValueError("The file has no video stream")
-        duration = float(video.duration * video.time_base) if video.duration else container.duration / av.time_base
+        if video.duration:
+            duration = float(video.duration * video.time_base)
+        elif container.duration:
+            duration = container.duration / av.time_base
+        else:
+            raise ValueError("Could not determine the video's duration")
         rate = video.average_rate
         return {"duration": duration, "width": video.codec_context.width, "height": video.codec_context.height,
                 "frames": video.frames or None,
