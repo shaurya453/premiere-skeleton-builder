@@ -58,7 +58,7 @@ class GoogleDocsTests(unittest.TestCase):
 
         mock_resp = MagicMock()
         mock_resp.geturl.return_value = "https://docs.google.com/document/d/xyz/export?format=docx"
-        mock_resp.read.return_value = valid_docx_bytes
+        mock_resp.read.side_effect = [valid_docx_bytes, b""]  # one chunk, then EOF, like a real socket
         mock_resp.headers = {"Content-Disposition": 'attachment; filename="Downloaded_Script.docx"'}
         mock_resp.__enter__.return_value = mock_resp
 

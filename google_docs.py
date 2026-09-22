@@ -58,7 +58,8 @@ def download_google_doc(
     url_or_id: str,
     destination_dir: str | Path | None = None,
     filename: str | None = None,
-    timeout: int = 30,
+    timeout: int = 180,
+    progress=lambda m: None,
 ) -> Path:
     """Download a Google Doc as a .docx file using Google's direct export endpoint.
 
@@ -68,7 +69,10 @@ def download_google_doc(
         destination_dir: Directory where the .docx should be saved.
                          Defaults to `inputs/` or `.cache/gdocs/`.
         filename: Optional explicit filename. If omitted, uses the document title.
-        timeout: Network request timeout in seconds.
+        timeout: Network request timeout in seconds. Google renders the .docx export
+                 on the fly, which alone can take 20-30+ seconds for a doc with large
+                 embedded images before any bytes arrive, so this is generous on purpose.
+        progress: Called with a short human-readable string as bytes arrive.
 
     Returns:
         Path to the saved .docx file.
@@ -94,6 +98,7 @@ def download_google_doc(
     }
 
     req = urllib.request.Request(export_url, headers=headers)
+    progress("Contacting Google Docs — this can take a while for docs with large images…")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             final_url = resp.geturl()
@@ -106,8 +111,20 @@ def download_google_doc(
                     "or download the .docx file manually via File > Download > Microsoft Word (.docx)."
                 )
 
-            data = resp.read()
             resp_headers = resp.headers
+            total = int(resp_headers.get("Content-Length") or 0)
+            chunks, done, next_report = [], 0, 5 * 1024 * 1024
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                done += len(chunk)
+                if done >= next_report:
+                    progress(f"Downloading script from Google Docs: {done / 1024**2:.0f}"
+                             + (f" / {total / 1024**2:.0f}" if total else "") + " MB")
+                    next_report = done + 5 * 1024 * 1024
+            data = b"".join(chunks)
 
     except urllib.error.HTTPError as err:
         if err.code in (401, 403):

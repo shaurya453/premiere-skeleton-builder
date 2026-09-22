@@ -305,7 +305,7 @@ def main(smoke_test: bool = False):
         if is_google_doc_url(value):
             status("⏳ Downloading Google Doc…")
             try:
-                value = str(download_google_doc(value))
+                value = str(download_google_doc(value, progress=lambda m: status(f"⏳ {m}")))
             except Exception as err:
                 status(f"❌ Google Doc error: {err}")
                 if not quiet:

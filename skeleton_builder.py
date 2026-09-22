@@ -654,7 +654,8 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
     if is_google_doc_url(str_docx):
         print(f"Downloading Google Doc script: {str_docx}...", flush=True)
         inputs_dir = out / "inputs"
-        docx_path = download_google_doc(str_docx, destination_dir=inputs_dir)
+        docx_path = download_google_doc(str_docx, destination_dir=inputs_dir,
+                                         progress=lambda m: print(m, flush=True))
         docx = str(docx_path)
     else:
         docx_path = Path(docx)
