@@ -16,7 +16,10 @@ Open **Open Skeleton Builder.cmd** (Windows) or **Skeleton Builder.app** (Mac), 
    ("Downloading speech model — 42% (320 MB / 760 MB)") instead of sitting silently.
    **Stop** cancels whichever run is currently active — there's no undo, but partial
    output stays on disk.
-4. **Run Premiere Pro with Skeleton** opens the finished timeline in Premiere.
+4. **Copy Skeleton Path & Open Premiere** launches Premiere and copies the XML path to your
+   clipboard. Premiere Pro has no supported way to import an XML automatically from outside
+   the app, so finish it there: File > Import (Ctrl/Cmd+I), then paste the path into the
+   filename box and press Enter.
 
 By default, `Projects`, `Media`, `Models` and `Cache` folders are created next to the app
 itself (alongside `SkeletonBuilder.exe`/`Premiere Skeleton Builder.app`, or the project root

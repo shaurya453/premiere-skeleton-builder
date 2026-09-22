@@ -562,23 +562,38 @@ def main(smoke_test: bool = False):
         return known.get(selected[0]) or next(iter(known.values()), None)
 
     def run_premiere():
+        # Premiere Pro has no supported way to open/import an FCP7 XML from outside the
+        # app — its executable only recognizes a .prproj on the command line, so passing
+        # the XML path is silently ignored and Premiere just shows its normal startup
+        # screen. There's no reliable unattended fix short of building and installing a
+        # Premiere CEP/UXP scripting extension, so the real workflow is: launch Premiere
+        # as a convenience, copy the path, and tell the user to paste it into Import.
         xml = skeleton_xml(chosen_run())
         if not xml:
             messagebox.showwarning("Not ready", "This run has no Skeleton_full.xml yet.")
             return
         window.clipboard_clear()
-        window.clipboard_append(str(xml))  # fallback: paste into File > Import if Premiere does not import automatically
+        window.clipboard_append(str(xml))
         program = settings_vars["premiere_exe"].get().strip() or find_premiere()
-        try:
-            if program and sys.platform == "darwin":
-                subprocess.Popen(["open", "-a", program, str(xml)])
-            elif program:
-                subprocess.Popen([program, str(xml)])
-            else:
-                os.startfile(str(xml))
-        except Exception as error:
-            messagebox.showerror("Could not start Premiere Pro",
-                                 f"{error}\n\nSet the program in Paths & Options. The XML path is on your clipboard for File > Import.")
+        opened = False
+        if program:
+            try:
+                if sys.platform == "darwin":
+                    subprocess.Popen(["open", "-a", program])
+                else:
+                    subprocess.Popen([program])
+                opened = True
+            except Exception:
+                opened = False
+        messagebox.showinfo(
+            "Copy Skeleton Path",
+            ("Premiere Pro is opening. " if opened else "Couldn't launch Premiere Pro automatically — "
+             "open it yourself, or set its location in Paths & Options. ") +
+            "Premiere has no way to import an XML automatically from outside the app, so finish it "
+            "manually:\n\n"
+            "1. In Premiere, press Ctrl+I (Cmd+I on Mac), or File > Import.\n"
+            "2. Paste the path (already on your clipboard) into the filename box and press Enter.\n\n"
+            f"Path: {xml}")
 
     def open_project():
         run = chosen_run()
@@ -614,7 +629,7 @@ def main(smoke_test: bool = False):
 
     button_row = ttk.Frame(result_group)
     button_row.pack(fill="x")
-    premiere_btn = ttk.Button(button_row, text="▶  Run Premiere Pro with Skeleton", command=run_premiere, padding=(10, 5))
+    premiere_btn = ttk.Button(button_row, text="📋  Copy Skeleton Path & Open Premiere", command=run_premiere, padding=(10, 5))
     premiere_btn.pack(side="left", padx=(0, 8))
     ttk.Button(button_row, text="Open project folder", command=open_project, padding=(10, 5)).pack(side="left", padx=(0, 8))
     retry_btn = ttk.Button(button_row, text="⟳  Retry script & audio fetch", command=retry_run, padding=(10, 5))
