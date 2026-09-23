@@ -30,7 +30,8 @@ from paths import NO_WINDOW, cache_dir, ffmpeg_exe, local_cache_dir
 
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
       "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
-      "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships"}
+      "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+      "v": "urn:schemas-microsoft-com:vml"}
 FPS = 30000 / 1001
 TOKEN = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
 
@@ -51,7 +52,7 @@ def clock(seconds):
 
 def bookmark_id(target):
     found = re.search(r"(?:bookmark=)(?:id\.)?([^&#]+)", target)
-    return unquote(found.group(1)) if found else target.removeprefix("id.")
+    return unquote(found.group(1) if found else target.removeprefix("id."))
 
 
 
@@ -104,9 +105,50 @@ def visual_links(raw, links, bookmark_images, warnings, fetch_image=None):
                     warnings.append(f"Could not download image {target}: {error}")
         if asset or explicit or remote:
             result.append({**link, 'kind':'image', 'asset':asset, 'inline':bool(asset and not explicit and not remote)})
+        elif not is_http(target) or "bookmark=" in target:
+            # Looks like a reference to a same-document bookmark (internal anchor, or a
+            # Google-Docs-exported "#bookmark=id.xxx" link) that never resolved to an
+            # embedded image, regardless of whether the label text says "IMG" - surface it
+            # instead of silently dropping the cue.
+            warnings.append(f"Missing bookmark/image for {label}: {target}")
         elif id(link) not in used and video_link(target) and re.search(r'\d+:\d{2}',label):
             warnings.append(f"Video timestamp needs a complete start/end range: {label}")
     return sorted(result, key=lambda l:l['start'])
+
+
+def _extract_embedded_image(archive, archive_path, assets_dir, index, node, apply_crop):
+    """Write an embedded picture to disk and return its asset dict (without 'bookmarks').
+
+    `apply_crop` is only meaningful for DrawingML (`a:blip`) pictures: Word stores the full
+    original image and keeps any crop the writer applied as a sibling `<a:srcRect>`
+    (thousandths-of-a-percent trimmed from each edge), not baked into the pixels, so it has
+    to be applied here for the timeline to show what was actually framed in the doc. Legacy
+    VML pictures (`v:imagedata`) store crop differently and aren't handled yet - they're
+    still captured, just without crop support.
+    """
+    data = archive.read(archive_path)
+    filename = f"asset_{index:02d}" + Path(archive_path).suffix.lower()
+    target = assets_dir / filename
+    target.write_bytes(data)
+    with Image.open(target) as image:
+        image.load()
+        width, height = image.size
+        if apply_crop:
+            src_rect = node.getparent().find(q("a", "srcRect"))
+            if src_rect is not None:
+                l = int(src_rect.get("l", "0")) / 100000
+                t = int(src_rect.get("t", "0")) / 100000
+                r = int(src_rect.get("r", "0")) / 100000
+                b = int(src_rect.get("b", "0")) / 100000
+                if any((l, t, r, b)):
+                    box = (round(width*l), round(height*t),
+                           round(width*(1-r)), round(height*(1-b)))
+                    if box[0] < box[2] and box[1] < box[3]:
+                        image = image.crop(box)
+                        image.save(target)
+                        width, height = image.size
+    return {"path": str(target.resolve()), "width": width, "height": height,
+            "source_part": archive_path, "sha256": hashlib.sha256(data).hexdigest()}
 
 
 def read_docx(path, assets_dir, fetch_web=True):
@@ -118,52 +160,37 @@ def read_docx(path, assets_dir, fetch_web=True):
         root = ET.fromstring(archive.read("word/document.xml"))
         relationships = {e.get("Id"): e.get("Target") for e in
                          ET.fromstring(archive.read("word/_rels/document.xml.rels"))}
-        bookmark_images, embedded, pending = {}, [], []
+        bookmark_names_seen, bookmark_images, embedded, pending = set(), {}, [], []
         for node in root.iter():
             if node.tag == q("w", "bookmarkStart"):
-                pending.append(node.get(q("w", "name")))
-            elif node.tag == q("a", "blip"):
-                relation = relationships.get(node.get(q("r", "embed")))
+                name = node.get(q("w", "name"))
+                pending.append(name)
+                bookmark_names_seen.add(name)
+            elif node.tag in (q("a", "blip"), q("v", "imagedata")):
+                is_blip = node.tag == q("a", "blip")
+                embed_id = node.get(q("r", "embed")) if is_blip else node.get(q("r", "id"))
+                relation = relationships.get(embed_id)
                 if not relation:
                     continue
                 archive_path = "word/" + relation
                 try:
-                    data = archive.read(archive_path)
-                    filename = f"asset_{len(embedded)+1:02d}" + Path(relation).suffix.lower()
-                    target = assets_dir / filename
-                    target.write_bytes(data)
-                    with Image.open(target) as image:
-                        image.load()
-                        width, height = image.size
-                        # Word stores the full original image and keeps any crop the writer
-                        # applied as a sibling <a:srcRect> (thousandths-of-a-percent trimmed
-                        # from each edge), not baked into the pixels; apply it here so the
-                        # timeline shows what was actually framed in the doc.
-                        src_rect = node.getparent().find(q("a", "srcRect"))
-                        if src_rect is not None:
-                            l = int(src_rect.get("l", "0")) / 100000
-                            t = int(src_rect.get("t", "0")) / 100000
-                            r = int(src_rect.get("r", "0")) / 100000
-                            b = int(src_rect.get("b", "0")) / 100000
-                            if any((l, t, r, b)):
-                                box = (round(width*l), round(height*t),
-                                       round(width*(1-r)), round(height*(1-b)))
-                                if box[0] < box[2] and box[1] < box[3]:
-                                    image = image.crop(box)
-                                    image.save(target)
-                                    width, height = image.size
-                    asset = {"path": str(target.resolve()), "width": width, "height": height,
-                             "bookmarks": list(pending), "source_part": archive_path,
-                             "sha256": hashlib.sha256(data).hexdigest()}
+                    asset = _extract_embedded_image(archive, archive_path, assets_dir,
+                                                      len(embedded) + 1, node, is_blip)
+                    asset["bookmarks"] = list(pending)
                     embedded.append(asset)
                     for name in pending:
                         bookmark_images[name] = asset
+                    pending = []
                 except Exception as error:
                     # A format PIL can't open (e.g. an embedded WMF/EMF) shouldn't sink the
                     # whole build; skip this one picture and let the normal "Missing
-                    # bookmark/image" warning below cover its cue instead.
-                    warnings.append(f"Skipped unreadable embedded image {archive_path}: {error}")
-                pending = []
+                    # bookmark/image" warning below cover its cue instead. Keep `pending` -
+                    # an unrelated/unreadable picture between a bookmark and its real image
+                    # shouldn't cost that bookmark its chance to attach further down.
+                    note = f" (bookmarks: {', '.join(pending)})" if pending else ""
+                    warnings.append(f"Skipped unreadable embedded image {archive_path}: {error}{note}")
+        for name in sorted(bookmark_names_seen - bookmark_images.keys()):
+            warnings.append(f"Bookmark '{name}' was never attached to any image")
 
         paragraphs = []
         for p in root.findall(".//w:p", NS):

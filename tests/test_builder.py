@@ -107,6 +107,117 @@ class BookmarkTests(unittest.TestCase):
             with Image.open(assets[0]["path"]) as saved:
                 self.assertEqual(saved.size, (50, 80))
 
+    def test_unrelated_unreadable_image_does_not_orphan_a_later_bookmark(self):
+        # A decorative/unrelated picture that fails to open (e.g. a WMF Word embeds for a
+        # link preview) sitting between a bookmark and its real image must not steal that
+        # bookmark - the next readable, bookmarked image downstream should still get it.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            Image.new("RGB", (60, 40)).save(root / "img.png")
+            doc = '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+                     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body>
+                     <w:p><w:r><w:t>They found the book. (</w:t></w:r><w:hyperlink w:anchor="first"><w:r><w:t>IMG 1</w:t></w:r></w:hyperlink><w:r><w:t>)</w:t></w:r></w:p>
+                     <w:bookmarkStart w:id="1" w:name="first"/>
+                     <w:p><a:blip r:embed="bad"/></w:p>
+                     <w:p><a:blip r:embed="a1"/></w:p>
+                     </w:body></w:document>'''
+            rels = '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="bad" Target="media/broken.wmf"/>
+                      <Relationship Id="a1" Target="media/image1.png"/></Relationships>'''
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+                z.writestr("word/media/broken.wmf", b"not actually an image")
+                z.write(root / "img.png", "word/media/image1.png")
+            words, cues, assets, warnings = read_docx(root / "script.docx", root / "assets")
+            self.assertTrue(any("Skipped unreadable embedded image" in w for w in warnings))
+            self.assertFalse(any("Missing bookmark/image" in w for w in warnings))
+            self.assertFalse(any("never attached to any image" in w for w in warnings))
+            self.assertEqual(len(assets), 1)
+            self.assertEqual(assets[0]["source_part"], "word/media/image1.png")
+            self.assertEqual(cues[0]["refs"][0]["asset"]["source_part"], "word/media/image1.png")
+
+    def test_non_img_labelled_missing_bookmark_now_warns(self):
+        # A hyperlink to a bookmark that never resolved to an image used to be dropped
+        # completely (no warning at all) unless its label literally said "IMG". Any
+        # unresolved reference to a same-document bookmark should be surfaced.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            doc = '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>
+                     <w:p><w:r><w:t>They found the </w:t></w:r><w:hyperlink w:anchor="missing"><w:r><w:t>book</w:t></w:r></w:hyperlink><w:r><w:t>.</w:t></w:r></w:p>
+                     </w:body></w:document>'''
+            rels = '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'''
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+            words, cues, assets, warnings = read_docx(root / "script.docx", root / "assets")
+            self.assertTrue(any("Missing bookmark/image for book: missing" in w for w in warnings))
+
+    def test_vml_legacy_picture_is_extracted(self):
+        # A picture stored via the legacy VML fallback (w:pict/v:imagedata, r:id instead of
+        # r:embed) previously had no matching branch at all and was invisible to the scanner.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            Image.new("RGB", (60, 40)).save(root / "img.png")
+            doc = '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+                     xmlns:v="urn:schemas-microsoft-com:vml"><w:body>
+                     <w:p><w:r><w:t>They found the book. (</w:t></w:r><w:hyperlink w:anchor="first"><w:r><w:t>IMG 1</w:t></w:r></w:hyperlink><w:r><w:t>)</w:t></w:r></w:p>
+                     <w:bookmarkStart w:id="1" w:name="first"/><w:p><w:r><w:pict><v:shape><v:imagedata r:id="a1"/></v:shape></w:pict></w:r></w:p>
+                     </w:body></w:document>'''
+            rels = '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="a1" Target="media/image1.png"/></Relationships>'''
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+                z.write(root / "img.png", "word/media/image1.png")
+            words, cues, assets, warnings = read_docx(root / "script.docx", root / "assets")
+            self.assertFalse(warnings)
+            self.assertEqual(len(assets), 1)
+            self.assertEqual(assets[0]["source_part"], "word/media/image1.png")
+            self.assertEqual(cues[0]["refs"][0]["asset"]["source_part"], "word/media/image1.png")
+
+    def test_percent_encoded_bookmark_anchor_matches_unicode_name(self):
+        # bookmark_id() must unquote() the plain-w:anchor fallback path too, not just the
+        # Google-Docs "#bookmark=id.xxx" branch, so percent-encoded anchors still match the
+        # raw-unicode name a bookmarkStart actually stores.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            Image.new("RGB", (60, 40)).save(root / "img.png")
+            doc = '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+                     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body>
+                     <w:p><w:r><w:t>They found the book. (</w:t></w:r><w:hyperlink w:anchor="caf%C3%A9"><w:r><w:t>IMG 1</w:t></w:r></w:hyperlink><w:r><w:t>)</w:t></w:r></w:p>
+                     <w:bookmarkStart w:id="1" w:name="café"/><w:p><a:blip r:embed="a1"/></w:p>
+                     </w:body></w:document>'''
+            rels = '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="a1" Target="media/image1.png"/></Relationships>'''
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+                z.write(root / "img.png", "word/media/image1.png")
+            words, cues, assets, warnings = read_docx(root / "script.docx", root / "assets")
+            self.assertFalse(warnings)
+            self.assertEqual(len(assets), 1)
+            self.assertEqual(cues[0]["refs"][0]["asset"]["source_part"], "word/media/image1.png")
+
+    def test_bookmark_with_no_nearby_image_warns(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            doc = '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>
+                     <w:p><w:r><w:t>Just narration, no image link at all.</w:t></w:r></w:p>
+                     <w:bookmarkStart w:id="1" w:name="orphan"/>
+                     </w:body></w:document>'''
+            rels = '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'''
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+            words, cues, assets, warnings = read_docx(root / "script.docx", root / "assets")
+            self.assertTrue(any("Bookmark 'orphan' was never attached to any image" in w for w in warnings))
+
     def test_wrong_audio_cache_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
