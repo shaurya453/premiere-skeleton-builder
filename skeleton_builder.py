@@ -135,6 +135,23 @@ def read_docx(path, assets_dir, fetch_web=True):
                     with Image.open(target) as image:
                         image.load()
                         width, height = image.size
+                        # Word stores the full original image and keeps any crop the writer
+                        # applied as a sibling <a:srcRect> (thousandths-of-a-percent trimmed
+                        # from each edge), not baked into the pixels; apply it here so the
+                        # timeline shows what was actually framed in the doc.
+                        src_rect = node.getparent().find(q("a", "srcRect"))
+                        if src_rect is not None:
+                            l = int(src_rect.get("l", "0")) / 100000
+                            t = int(src_rect.get("t", "0")) / 100000
+                            r = int(src_rect.get("r", "0")) / 100000
+                            b = int(src_rect.get("b", "0")) / 100000
+                            if any((l, t, r, b)):
+                                box = (round(width*l), round(height*t),
+                                       round(width*(1-r)), round(height*(1-b)))
+                                if box[0] < box[2] and box[1] < box[3]:
+                                    image = image.crop(box)
+                                    image.save(target)
+                                    width, height = image.size
                     asset = {"path": str(target.resolve()), "width": width, "height": height,
                              "bookmarks": list(pending), "source_part": archive_path,
                              "sha256": hashlib.sha256(data).hexdigest()}
@@ -506,8 +523,8 @@ def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, hei
         sub(source, "trackindex", 1)
         sub(track, "enabled", "TRUE")
         sub(track, "locked", "FALSE")
-    # Keep stereo source sound linked but disabled under narration. It is enabled
-    # in the exact source-selects sequence where there is no competing voiceover.
+    # Stereo source sound is linked on its own tracks so it can be muted per-clip
+    # in Premiere if it ever competes with narration.
     for channel in (1, 2):
         if not source_audio:
             break
@@ -620,7 +637,7 @@ def write_report(out, report, voiceover):
     page = """<!doctype html><html><head><meta charset="utf-8"><title>Skeleton review</title>
 <style>body{font:16px/1.5 system-ui;background:#10141d;color:#eef1f6;max-width:1080px;margin:36px auto;padding:0 24px}h1{font-size:36px;margin-bottom:6px}h2{font-size:20px;margin:0 0 10px}p{max-width:850px}a{color:#91bcff}header{position:sticky;top:0;background:#10141df5;padding:14px 0;z-index:1}audio{width:100%}article{display:grid;grid-template-columns:210px 1fr;gap:28px;padding:24px 0;border-bottom:1px solid #30394a}article img{width:210px;height:190px;object-fit:contain;background:#080a0f}small{color:#aeb9cb}button{background:#283d5b;color:white;border:0;padding:8px 12px;border-radius:6px;cursor:pointer}.video{display:grid;place-items:center;background:#1a2434;color:#90a3bf}li{margin:8px 0}</style></head><body>
 <h1>Script → timeline</h1><p>Editable Premiere skeleton · 1920 × 1080 · 29.97 fps · approximate word boundaries</p>
-<p>Import <b>Timeline/Skeleton_full.xml</b> into Premiere. V2 contains images and any prepared video clips; V1 contains removable guide cards in uncovered gaps; A1 contains narration. Prepared source audio is linked but disabled on A2/A3. <b>Timeline/Source_Selects.xml</b>, when present, contains exact requested video excerpts with source sound enabled. Click a timing to listen to the narration.</p>
+<p>Import <b>Timeline/Skeleton_full.xml</b> into Premiere. V2 contains images and any prepared video clips; V1 contains removable guide cards in uncovered gaps; A1 contains narration. Prepared source audio is linked and enabled on A2/A3 (mute individual clips in Premiere if it competes with narration). <b>Timeline/Source_Selects.xml</b>, when present, contains exact requested video excerpts with source sound enabled. Click a timing to listen to the narration.</p>
 <header><audio id="player" controls src="__VO__"></audio></header>
 """ + f'<p>Timing: {esc(report["timing_method"])}.</p><ul>{warnings}</ul>' + "".join(rows) + """
 <script>document.querySelectorAll('button[data-time]').forEach(b=>b.addEventListener('click',()=>{const a=document.getElementById('player');a.currentTime=Number(b.dataset.time);a.play()}));</script></body></html>"""
@@ -773,8 +790,10 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
                 continue
             writer.writerow([c["name"], round(c["start_frame"]/FPS, 3), round(c["end_frame"]/FPS, 3),
                              c["start_frame"], c["end_frame"], c["passage"], c["path"], c.get("source_url", "")])
-    xml_sequence(out / "Skeleton_full.xml", "Script skeleton - full", clips, gaps, cues, wav, duration, width, height)
-    xml_sequence(out / "Skeleton_test_45s.xml", "Script skeleton - first 45 seconds", clips, gaps, cues, wav, duration, width, height, 45)
+    xml_sequence(out / "Skeleton_full.xml", "Script skeleton - full", clips, gaps, cues, wav, duration, width, height,
+                 source_audio_enabled=True)
+    xml_sequence(out / "Skeleton_test_45s.xml", "Script skeleton - first 45 seconds", clips, gaps, cues, wav, duration, width, height, 45,
+                 source_audio_enabled=True)
     validate_xml(out / "Skeleton_full.xml")
     validate_xml(out / "Skeleton_test_45s.xml")
     if video_selects:
@@ -802,8 +821,8 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
         "2. Open the imported sequence. Check image timing, fit and narration.\n"
         "3. Import Timeline/Skeleton_full.xml for the complete sequence.\n\n"
         "V2: editable images and prepared videos. V1: temporary guide cards in uncovered gaps. A1: narration.\n"
-        "A2/A3: linked source-video sound, disabled so it does not compete with narration.\n"
-        "Enable those audio clips in Premiere if source sound is wanted.\n"
+        "A2/A3: linked source-video sound, enabled by default. Mute those clips in Premiere\n"
+        "if source sound ever competes with narration.\n"
         "Timeline/Source_Selects.xml (when present): exact full requested excerpts, source sound enabled.\n"
         "Video URLs and requested ranges are also in sequence markers. Failed downloads stay as markers.\n"
         "Main video placements start at the preceding paragraph/portion, play at normal speed, and\n"

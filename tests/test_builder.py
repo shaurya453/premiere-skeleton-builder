@@ -80,6 +80,33 @@ class BookmarkTests(unittest.TestCase):
             self.assertTrue(any("Skipped unreadable embedded image" in w for w in warnings))
             self.assertTrue(any("Missing bookmark/image" in w for w in warnings))
 
+    def test_embedded_image_crop_is_applied(self):
+        # Word keeps the full original image and stores any crop the writer applied as a
+        # sibling <a:srcRect> (thousandths-of-a-percent trimmed from each edge). The saved
+        # asset should reflect the cropped region, not the original full image.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            Image.new("RGB", (100, 100)).save(root / "img.png")
+            # l=25%, t=10%, r=25%, b=10% -> crop to the middle 50x80 region.
+            doc = '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+                     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body>
+                     <w:p><w:r><w:t>They found the book. (</w:t></w:r><w:hyperlink w:anchor="first"><w:r><w:t>IMG 1</w:t></w:r></w:hyperlink><w:r><w:t>)</w:t></w:r></w:p>
+                     <w:bookmarkStart w:id="1" w:name="first"/><w:p><a:blipFill><a:blip r:embed="a1"/><a:srcRect l="25000" t="10000" r="25000" b="10000"/></a:blipFill></w:p>
+                     </w:body></w:document>'''
+            rels = '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="a1" Target="media/image1.png"/></Relationships>'''
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+                z.write(root / "img.png", "word/media/image1.png")
+            words, cues, assets, warnings = read_docx(root / "script.docx", root / "assets")
+            self.assertFalse(warnings)
+            self.assertEqual(len(assets), 1)
+            self.assertEqual((assets[0]["width"], assets[0]["height"]), (50, 80))
+            with Image.open(assets[0]["path"]) as saved:
+                self.assertEqual(saved.size, (50, 80))
+
     def test_wrong_audio_cache_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
