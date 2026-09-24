@@ -41,11 +41,16 @@ jobs:
         run: Compress-Archive -Path dist/SkeletonBuilder -DestinationPath "SkeletonBuilder-${{ matrix.name }}.zip"
       - name: Package (macOS)
         if: runner.os == 'macOS'
-        # `ditto -c` can't archive multiple sources in one call, so archive dist/ itself
-        # (without --keepParent, which flattens its contents to the archive root) instead of
-        # naming the .app alone - dist/ contains only the .app plus the default
-        # Projects/Media/Models/Cache/Temp folders build_app.py ships beside it.
-        run: ditto -c -k dist "SkeletonBuilder-${{ matrix.name }}.zip"
+        # PyInstaller's --windowed onedir build produces both the .app bundle and a plain
+        # onedir folder of the same content (dist/Premiere Skeleton Builder, no .app suffix) -
+        # only the .app is meant to ship. `ditto -c` can't archive multiple sources in one
+        # call, so drop the duplicate and archive dist/ itself (without --keepParent, which
+        # flattens a single source's contents to the archive root) rather than naming the
+        # .app alone, so the default Projects/Media/Models/Cache/Temp folders build_app.py
+        # ships beside it come along too.
+        run: |
+          rm -rf "dist/Premiere Skeleton Builder"
+          ditto -c -k dist "SkeletonBuilder-${{ matrix.name }}.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: SkeletonBuilder-${{ matrix.name }}
