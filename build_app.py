@@ -16,6 +16,24 @@ import PyInstaller.__main__
 HERE = Path(__file__).resolve().parent
 
 
+def _windows_tcl_tk_dirs():
+    """Find this Python's own Tcl/Tk library directories directly, rather than relying on
+    PyInstaller's build-time auto-probe (which silently bundles nothing - no warning, no
+    error - if it can't launch a working Tcl interpreter on the build machine)."""
+    tcl_root = Path(sys.base_prefix) / "tcl"
+    tcl_dir = next(iter(sorted(tcl_root.glob("tcl8.*"))), None)
+    tk_dir = next(iter(sorted(tcl_root.glob("tk8.*"))), None)
+    return tcl_dir, tk_dir
+
+
+def _assert_tcl_bundled(dist_dir):
+    """A frozen app with no Tcl/Tk data directory fails at launch with a cryptic 'Can't find
+    a usable init.tcl' error instead of at build time - fail loudly here instead."""
+    if not any(dist_dir.rglob("init.tcl")):
+        raise SystemExit(f"Tcl/Tk was not bundled into {dist_dir} (no init.tcl found anywhere "
+                          "in the build output) - the packaged app would fail to launch.")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--node", help="path to a Node.js executable to bundle")
@@ -38,9 +56,19 @@ def main():
     ]
     if mac:
         options += ["--osx-bundle-identifier", "com.skeletonbuilder.app"]
+    else:
+        tcl_dir, tk_dir = _windows_tcl_tk_dirs()
+        if not tcl_dir or not tk_dir:
+            raise SystemExit(f"Could not find Tcl/Tk under {Path(sys.base_prefix) / 'tcl'} - "
+                              "the packaged app would launch without a usable Tk.")
+        options += ["--add-data", f"{tcl_dir}{os.pathsep}_tcl_data",
+                    "--add-data", f"{tk_dir}{os.pathsep}_tk_data"]
     if args.node:
         options += ["--add-binary", f"{args.node}{os.pathsep}tools"]
     PyInstaller.__main__.run(options)
+
+    dist_dir = HERE / "dist" / ("Premiere Skeleton Builder.app" if mac else "SkeletonBuilder")
+    _assert_tcl_bundled(dist_dir)
 
 
 if __name__ == "__main__":
