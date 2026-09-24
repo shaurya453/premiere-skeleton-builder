@@ -66,6 +66,7 @@ def visual_links(raw, links, bookmark_images, warnings, fetch_image=None):
     """
     from youtube_media import source_range
     from web_media import identify_source, is_direct_image_url, is_http
+    from drive_audio import is_drive_url
     def video_link(target):
         return is_http(target) and not is_direct_image_url(target)
     ranges = list(re.finditer(r"\d+:\d{2}(?::\d{2})?(?:\.\d+)?\s*[-–—]\s*\d+:\d{2}(?::\d{2})?(?:\.\d+)?", raw))
@@ -94,7 +95,11 @@ def visual_links(raw, links, bookmark_images, warnings, fetch_image=None):
         asset = bookmark_images.get(bookmark_id(target))
         explicit = bool(re.search(r'\bIMG(?:\s*\d+)?\s*$', label, re.I) or
                         (label.strip().isdigit() and 'IMG' in raw[max(0,link['start']-15):link['start']]))
-        remote = not asset and is_http(target) and (is_direct_image_url(target) or explicit)
+        # A Drive share link is treated as an image candidate unconditionally - unlike a
+        # generic web page, it's never a plausible "plain reference" link, and requiring an
+        # "IMG" label on top of it (as for other page links) just drops real images that
+        # happen to be unlabelled.
+        remote = not asset and is_http(target) and (is_direct_image_url(target) or explicit or is_drive_url(target))
         if remote:
             if fetch_image is None:
                 asset = {"path": None, "remote": target}
@@ -113,6 +118,11 @@ def visual_links(raw, links, bookmark_images, warnings, fetch_image=None):
             warnings.append(f"Missing bookmark/image for {label}: {target}")
         elif id(link) not in used and video_link(target) and re.search(r'\d+:\d{2}',label):
             warnings.append(f"Video timestamp needs a complete start/end range: {label}")
+        else:
+            # Any other http(s) link that isn't part of a video timestamp range and wasn't
+            # recognized as an image - surface it so a future recognition gap is a visible
+            # warning instead of silently vanishing.
+            warnings.append(f"Unrecognized link (not video, image, or bookmark): {label}: {target}")
     return sorted(result, key=lambda l:l['start'])
 
 
@@ -151,6 +161,79 @@ def _extract_embedded_image(archive, archive_path, assets_dir, index, node, appl
             "source_part": archive_path, "sha256": hashlib.sha256(data).hexdigest()}
 
 
+def _read_relationships(archive, rels_path):
+    """Id -> (Target, TargetMode). TargetMode is 'External' for a linked (not embedded)
+    picture, None otherwise. Returns {} if the part has no relationships file at all."""
+    if rels_path not in archive.namelist():
+        return {}
+    return {e.get("Id"): (e.get("Target"), e.get("TargetMode"))
+            for e in ET.fromstring(archive.read(rels_path))}
+
+
+def _scan_bookmarks_and_pictures(archive, root, relationships, assets_dir, bookmark_names_seen,
+                                  bookmark_images, embedded, warnings, order_start, order_of=None):
+    """Walk one XML part (document.xml, or a header/footer/footnote/endnote part) in document
+    order, extracting every bookmark -> picture attachment. Mutates bookmark_names_seen,
+    bookmark_images and embedded in place; returns the next free order value so callers can
+    scan several parts on one shared ordering axis (used to place unaligned media in script
+    order later). `order_of`, when given, records each paragraph's position (keyed by its
+    stable tree path, not id() - lxml doesn't guarantee a proxy object's Python identity
+    survives being re-fetched by a later findall()) so paragraphs looked up afterwards in the
+    *same* root can be placed on that same axis.
+    """
+    open_bookmarks, pending, order = {}, [], order_start
+    for node in root.iter():
+        # Every node gets its own unique, strictly increasing index - captured once here and
+        # reused below (for a picture's doc_order) rather than re-reading the now-incremented
+        # `order`, which would shift pictures forward by one and could tie or invert against a
+        # paragraph's own (pre-increment) order value.
+        current, order = order, order + 1
+        if order_of is not None and node.tag == q("w", "p"):
+            order_of[root.getroottree().getpath(node)] = current
+        if node.tag == q("w", "bookmarkStart"):
+            name = node.get(q("w", "name"))
+            pending.append(name)
+            bookmark_names_seen.add(name)
+            open_bookmarks[node.get(q("w", "id"))] = name
+        elif node.tag == q("w", "bookmarkEnd"):
+            # A bookmark that already closed shouldn't keep absorbing a later, unrelated
+            # picture - only bookmarks still open when a picture is found should attach to it.
+            name = open_bookmarks.pop(node.get(q("w", "id")), None)
+            if name in pending:
+                pending.remove(name)
+        elif node.tag in (q("a", "blip"), q("v", "imagedata")):
+            is_blip = node.tag == q("a", "blip")
+            embed_id = node.get(q("r", "embed")) if is_blip else node.get(q("r", "id"))
+            relation = relationships.get(embed_id)
+            note = f" (bookmarks: {', '.join(pending)})" if pending else ""
+            if not relation:
+                warnings.append(f"Could not resolve picture relationship {embed_id!r}{note}")
+                continue
+            target, target_mode = relation
+            if target_mode == "External":
+                warnings.append(f"Picture is linked, not embedded in the document ({target}); "
+                                 f"cannot recover its file{note}")
+                continue
+            archive_path = "word/" + target
+            try:
+                asset = _extract_embedded_image(archive, archive_path, assets_dir,
+                                                  len(embedded) + 1, node, is_blip)
+                asset["bookmarks"] = list(pending)
+                asset["doc_order"] = current
+                embedded.append(asset)
+                for name in pending:
+                    bookmark_images[name] = asset
+                pending.clear()
+            except Exception as error:
+                # A format PIL can't open (e.g. an embedded WMF/EMF) shouldn't sink the
+                # whole build; skip this one picture and let the normal "Missing
+                # bookmark/image" warning below cover its cue instead. Keep `pending` -
+                # an unrelated/unreadable picture between a bookmark and its real image
+                # shouldn't cost that bookmark its chance to attach further down.
+                warnings.append(f"Skipped unreadable embedded image {archive_path}: {error}{note}")
+    return order
+
+
 def read_docx(path, assets_dir, fetch_web=True):
     """Read bookmarks in document order, including body-level bookmark nodes."""
     assets_dir.mkdir(parents=True, exist_ok=True)
@@ -158,37 +241,26 @@ def read_docx(path, assets_dir, fetch_web=True):
     warnings = []
     with ZipFile(path) as archive:
         root = ET.fromstring(archive.read("word/document.xml"))
-        relationships = {e.get("Id"): e.get("Target") for e in
-                         ET.fromstring(archive.read("word/_rels/document.xml.rels"))}
-        bookmark_names_seen, bookmark_images, embedded, pending = set(), {}, [], []
-        for node in root.iter():
-            if node.tag == q("w", "bookmarkStart"):
-                name = node.get(q("w", "name"))
-                pending.append(name)
-                bookmark_names_seen.add(name)
-            elif node.tag in (q("a", "blip"), q("v", "imagedata")):
-                is_blip = node.tag == q("a", "blip")
-                embed_id = node.get(q("r", "embed")) if is_blip else node.get(q("r", "id"))
-                relation = relationships.get(embed_id)
-                if not relation:
-                    continue
-                archive_path = "word/" + relation
-                try:
-                    asset = _extract_embedded_image(archive, archive_path, assets_dir,
-                                                      len(embedded) + 1, node, is_blip)
-                    asset["bookmarks"] = list(pending)
-                    embedded.append(asset)
-                    for name in pending:
-                        bookmark_images[name] = asset
-                    pending = []
-                except Exception as error:
-                    # A format PIL can't open (e.g. an embedded WMF/EMF) shouldn't sink the
-                    # whole build; skip this one picture and let the normal "Missing
-                    # bookmark/image" warning below cover its cue instead. Keep `pending` -
-                    # an unrelated/unreadable picture between a bookmark and its real image
-                    # shouldn't cost that bookmark its chance to attach further down.
-                    note = f" (bookmarks: {', '.join(pending)})" if pending else ""
-                    warnings.append(f"Skipped unreadable embedded image {archive_path}: {error}{note}")
+        relationships = _read_relationships(archive, "word/_rels/document.xml.rels")
+
+        bookmark_names_seen, bookmark_images, embedded, order_of = set(), {}, [], {}
+        order_counter = _scan_bookmarks_and_pictures(
+            archive, root, relationships, assets_dir, bookmark_names_seen, bookmark_images,
+            embedded, warnings, order_start=0, order_of=order_of)
+
+        # Headers/footers/footnotes/endnotes are separate XML parts, each with their own
+        # relationships file - a picture placed there is invisible to a pass over document.xml
+        # alone. Their text isn't narration, but any picture there should still be captured
+        # (and later placed on the timeline as an orphan, by document order) rather than
+        # silently missed.
+        for name in sorted(archive.namelist()):
+            if re.fullmatch(r"word/(header\d+|footer\d+|footnotes|endnotes)\.xml", name):
+                part_root = ET.fromstring(archive.read(name))
+                part_rels = _read_relationships(archive, f"word/_rels/{Path(name).name}.rels")
+                order_counter = _scan_bookmarks_and_pictures(
+                    archive, part_root, part_rels, assets_dir, bookmark_names_seen,
+                    bookmark_images, embedded, warnings, order_start=order_counter)
+
         for name in sorted(bookmark_names_seen - bookmark_images.keys()):
             warnings.append(f"Bookmark '{name}' was never attached to any image")
 
@@ -204,13 +276,15 @@ def read_docx(path, assets_dir, fetch_web=True):
                     for child in n:
                         visit(child)
                 if n.tag == q("w", "hyperlink"):
-                    target = relationships.get(n.get(q("r", "id"))) or n.get(q("w", "anchor"), "")
+                    rel = relationships.get(n.get(q("r", "id")))
+                    target = (rel[0] if rel else None) or n.get(q("w", "anchor"), "")
                     links.append({"start": start, "end": sum(map(len, pieces)), "target": target})
 
             visit(p)
             text = "".join(pieces)
             if text.strip():
-                paragraphs.append({"text": text, "links": links})
+                paragraphs.append({"text": text, "links": links,
+                                   "doc_order": order_of.get(root.getroottree().getpath(p), 0)})
 
     all_script_tokens, cues = [], []
     for paragraph in paragraphs:
@@ -256,6 +330,7 @@ def read_docx(path, assets_dir, fetch_web=True):
             passage = clean[ptokens[start_index][1]:ptokens[end_index-1][2]]
             cue = {"kind": kind, "script_start": base + start_index, "script_end": base + end_index,
                    "local_end": end_index, "passage": re.sub(r"\s+", " ", passage).strip(),
+                   "doc_order": paragraph["doc_order"],
                    "refs": [{"label": label, "target": link["target"], "asset": asset}]}
             cues.append(cue)
             previous = cue
@@ -461,7 +536,7 @@ def motion(clip, scale):
 
 
 def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, height, limit=None,
-                 source_audio_enabled=False):
+                 source_audio_enabled=False, unconfirmed=()):
     frames = math.ceil(duration * FPS) if limit is None else min(round(limit * FPS), math.ceil(duration * FPS))
     root = ET.Element("xmeml", version="5")
     seq = sub(root, "sequence", id="sequence-1")
@@ -478,7 +553,9 @@ def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, hei
     sample(sub(video, "format"), width, height)
 
     source_audio = []
-    for track_index, items in enumerate((gaps, clips)):
+    # V1 = guide cards (true gaps), V2 = confirmed/aligned media, V3 = resolved media the
+    # pipeline couldn't confidently time against the narration ("unsynced").
+    for track_index, items in enumerate((gaps, clips, unconfirmed)):
         track = sub(video, "track")
         for index, item in enumerate(items):
             start, end = item["start_frame"], min(item["end_frame"], frames)
@@ -666,7 +743,7 @@ def write_report(out, report, voiceover):
     page = """<!doctype html><html><head><meta charset="utf-8"><title>Skeleton review</title>
 <style>body{font:16px/1.5 system-ui;background:#10141d;color:#eef1f6;max-width:1080px;margin:36px auto;padding:0 24px}h1{font-size:36px;margin-bottom:6px}h2{font-size:20px;margin:0 0 10px}p{max-width:850px}a{color:#91bcff}header{position:sticky;top:0;background:#10141df5;padding:14px 0;z-index:1}audio{width:100%}article{display:grid;grid-template-columns:210px 1fr;gap:28px;padding:24px 0;border-bottom:1px solid #30394a}article img{width:210px;height:190px;object-fit:contain;background:#080a0f}small{color:#aeb9cb}button{background:#283d5b;color:white;border:0;padding:8px 12px;border-radius:6px;cursor:pointer}.video{display:grid;place-items:center;background:#1a2434;color:#90a3bf}li{margin:8px 0}</style></head><body>
 <h1>Script → timeline</h1><p>Editable Premiere skeleton · 1920 × 1080 · 29.97 fps · approximate word boundaries</p>
-<p>Import <b>Timeline/Skeleton_full.xml</b> into Premiere. V2 contains images and any prepared video clips; V1 contains removable guide cards in uncovered gaps; A1 contains narration. Prepared source audio is linked and enabled on A2/A3 (mute individual clips in Premiere if it competes with narration). <b>Timeline/Source_Selects.xml</b>, when present, contains exact requested video excerpts with source sound enabled. Click a timing to listen to the narration.</p>
+<p>Import <b>Timeline/Skeleton_full.xml</b> into Premiere. V2 contains images and video clips timed against the narration; V3 contains resolved media ("UNSYNCED ...") the pipeline couldn't confidently time - reposition these by hand, they're already the right file; V1 contains removable guide cards only where nothing at all could be resolved; A1 contains narration. Prepared source audio is linked and enabled on A2/A3 (mute individual clips in Premiere if it competes with narration). <b>Timeline/Source_Selects.xml</b>, when present, contains exact requested video excerpts with source sound enabled. Click a timing to listen to the narration.</p>
 <header><audio id="player" controls src="__VO__"></audio></header>
 """ + f'<p>Timing: {esc(report["timing_method"])}.</p><ul>{warnings}</ul>' + "".join(rows) + """
 <script>document.querySelectorAll('button[data-time]').forEach(b=>b.addEventListener('click',()=>{const a=document.getElementById('player');a.currentTime=Number(b.dataset.time);a.play()}));</script></body></html>"""
@@ -752,8 +829,14 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
     make_guide(guide, width, height)
     frames = math.ceil(duration*FPS)
     clips, used = [], set()
+    unconfirmed_image_refs = []
     for cue in cues:
-        if cue["start"] is None or cue["kind"] != "image":
+        if cue["kind"] != "image":
+            continue
+        if cue["start"] is None:
+            # Resolved (downloaded/extracted) but couldn't be timed against the narration -
+            # still gets placed, on the unsynced track below, instead of being dropped.
+            unconfirmed_image_refs.extend((cue, ref) for ref in cue["refs"] if ref["asset"])
             continue
         refs = cue["refs"]
         first, last = round(cue["start"] * FPS), min(frames, round(cue["end"] * FPS))
@@ -768,17 +851,21 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
                 continue
             label = ref["label"] if "IMG" in ref["label"].upper() else "IMG " + ref["label"]
             clips.append({**asset, "name": label, "start_frame": start, "end_frame": end,
-                          "passage": cue["passage"], "source_url": ref["target"]})
+                          "passage": cue["passage"], "source_url": ref["target"], "doc_order": cue.get("doc_order", 0)})
             used.add(asset["path"])
             if (end-start) / FPS < 1.2:
                 cue["review"].append(f"{label} is under 1.2 seconds; consider extending")
     video_assets, video_edits, video_selects = [], [], []
+    unconfirmed_video_refs = []
     if download_videos:
         from youtube_media import prepare_sources, place_video_clips
         video_assets, failures = prepare_sources(cues, media_dir / "Videos", handles, full_videos, full_limit=full_video_limit)
         warnings.extend(failures)
         video_edits, video_selects = place_video_clips(cues, clips, frames)
         clips.extend(video_edits)
+        for cue in cues:
+            if cue["kind"] == "video" and cue["start"] is None:
+                unconfirmed_video_refs.extend((cue, ref) for ref in cue["refs"] if ref.get("video_asset"))
     clips.sort(key=lambda c: c["start_frame"])
     # Bridge only tiny speech pauses. Preserve sentence end points across substantive gaps.
     for left, right in zip(clips, clips[1:]):
@@ -787,15 +874,83 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
             raise ValueError("Aligned image passages overlap; inspect cue mapping.")
         if left.get("kind") != "video" and 0 < gap <= round(.4 * FPS):
             left["end_frame"] = right["start_frame"]
+
+    # --- Unsynced track (V3): media the pipeline resolved but couldn't confidently time
+    # against the narration, plus embedded images never referenced by any cue at all. Placed
+    # in script order, in the gap between whichever two confirmed clips it falls between, on
+    # its own track - so nothing is left for the editor to track down by hand.
+    used_unconfirmed = set()
+    unconfirmed_items = []
+    for cue, ref in unconfirmed_image_refs:
+        asset = ref["asset"]
+        label = ref["label"] if "IMG" in ref["label"].upper() else "IMG " + ref["label"]
+        unconfirmed_items.append({**asset, "name": "UNSYNCED " + label, "passage": cue["passage"],
+                                  "source_url": ref["target"], "doc_order": cue.get("doc_order", 0),
+                                  "duration_frames": round(3 * FPS)})
+        used_unconfirmed.add(asset["path"])
+    for cue, ref in unconfirmed_video_refs:
+        asset = ref["video_asset"]
+        length = max(1, ref["out_frame"] - ref["in_frame"])
+        unconfirmed_items.append({**asset, "name": f"UNSYNCED VIDEO {ref['label']} | {asset['title']}",
+                                  "in_frame": ref["in_frame"], "passage": cue["passage"],
+                                  "source_url": ref["target"], "doc_order": cue.get("doc_order", 0),
+                                  "duration_frames": length})
+    unused = [a for a in embedded if a["path"] not in used and a["path"] not in used_unconfirmed]
+    for asset in unused:
+        unconfirmed_items.append({**asset, "name": "UNSYNCED " + Path(asset["path"]).stem,
+                                  "passage": "No narration reference; placed by document order",
+                                  "source_url": "", "doc_order": asset.get("doc_order", 0),
+                                  "duration_frames": round(3 * FPS)})
+    unconfirmed_items.sort(key=lambda i: i["doc_order"])
+
+    confirmed_sorted = sorted(clips, key=lambda c: c.get("doc_order", 0))
+    confirmed_orders = [c.get("doc_order", 0) for c in confirmed_sorted]
+    slots = {}
+    for item in unconfirmed_items:
+        idx = bisect.bisect_left(confirmed_orders, item["doc_order"])
+        left = confirmed_sorted[idx-1] if idx > 0 else None
+        right = confirmed_sorted[idx] if idx < len(confirmed_sorted) else None
+        window = (left["end_frame"] if left else 0, right["start_frame"] if right else frames)
+        slots.setdefault(window, []).append(item)
+
+    unconfirmed_clips = []
+    for (window_start, window_end), items in slots.items():
+        total_needed = sum(i["duration_frames"] for i in items)
+        available = max(0, window_end - window_start)
+        # Compress proportionally if the gap is too small to fit every item at its natural
+        # length. If there's no gap at all (confirmed clips back-to-back), still place each
+        # item at its natural length rather than dropping it - a later pass below resolves any
+        # resulting overlap between unsynced clips, and a slight overlap into the confirmed
+        # track's own time range is harmless since they're on separate tracks.
+        scale = min(1.0, available / total_needed) if total_needed and available else 1.0
+        cursor = window_start
+        for item in items:
+            dur = max(1, round(item["duration_frames"] * scale))
+            start, end = cursor, min(frames, cursor + dur)
+            if end > start:
+                unconfirmed_clips.append({**item, "start_frame": start, "end_frame": end})
+                cursor = end
+    unconfirmed_clips.sort(key=lambda c: c["start_frame"])
+    resolved_unconfirmed, cursor = [], 0
+    for clip in unconfirmed_clips:
+        start = max(clip["start_frame"], cursor)
+        end = min(frames, max(start + 1, clip["end_frame"]))
+        if start >= end:
+            warnings.append(f"Skipped unsynced clip with no remaining room: {clip['name']}")
+            continue
+        resolved_unconfirmed.append({**clip, "start_frame": start, "end_frame": end})
+        cursor = end
+    unconfirmed_clips = resolved_unconfirmed
+    if unconfirmed_clips:
+        warnings.append(f"{len(unconfirmed_clips)} item(s) could not be confidently timed against "
+                         "the narration; placed on the unsynced track (V3) in script order for manual repositioning.")
+
     gaps, cursor = [], 0
-    for clip in clips + [{"start_frame": frames, "end_frame": frames}]:
+    for clip in sorted(clips + unconfirmed_clips, key=lambda c: c["start_frame"]) + [{"start_frame": frames, "end_frame": frames}]:
         if cursor < clip["start_frame"]:
             gaps.append({"name": "GUIDE - visual to add", "path": str(guide), "width": width, "height": height,
                          "start_frame": cursor, "end_frame": clip["start_frame"]})
-        cursor = clip["end_frame"]
-    unused = [a for a in embedded if a["path"] not in used]
-    if unused:
-        warnings.append(f"{len(unused)} embedded image(s) have no placed script cue; preserved in the image folder.")
+        cursor = max(cursor, clip["end_frame"])
     if any(c["start"] is None for c in cues):
         warnings.append("Some cues could not be aligned; see unmatched entries in this report.")
     # Timeline/ holds just the XML deliverables; supporting data and the human-facing
@@ -807,6 +962,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
               "timing_method": method, "script_token_match": round(coverage, 3),
               "sources": {"docx": str(Path(docx).resolve()), "audio": str(Path(audio).resolve())},
               "warnings": warnings, "cues": cues, "clips": clips, "gaps": gaps,
+              "unconfirmed_clips": unconfirmed_clips,
               "unused_assets": unused, "embedded_assets": embedded,
               "video_assets": video_assets, "video_selects": video_selects,
               "video_options": {"enabled": download_videos, "handles_seconds": handles, "full_sources": full_videos, "full_video_limit_seconds": full_video_limit}}
@@ -820,9 +976,9 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
             writer.writerow([c["name"], round(c["start_frame"]/FPS, 3), round(c["end_frame"]/FPS, 3),
                              c["start_frame"], c["end_frame"], c["passage"], c["path"], c.get("source_url", "")])
     xml_sequence(out / "Skeleton_full.xml", "Script skeleton - full", clips, gaps, cues, wav, duration, width, height,
-                 source_audio_enabled=True)
+                 source_audio_enabled=True, unconfirmed=unconfirmed_clips)
     xml_sequence(out / "Skeleton_test_45s.xml", "Script skeleton - first 45 seconds", clips, gaps, cues, wav, duration, width, height, 45,
-                 source_audio_enabled=True)
+                 source_audio_enabled=True, unconfirmed=unconfirmed_clips)
     validate_xml(out / "Skeleton_full.xml")
     validate_xml(out / "Skeleton_test_45s.xml")
     if video_selects:
@@ -849,7 +1005,11 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
         "PREMIERE SKELETON TEST\n\n1. In Premiere use File > Import and select Timeline/Skeleton_test_45s.xml.\n"
         "2. Open the imported sequence. Check image timing, fit and narration.\n"
         "3. Import Timeline/Skeleton_full.xml for the complete sequence.\n\n"
-        "V2: editable images and prepared videos. V1: temporary guide cards in uncovered gaps. A1: narration.\n"
+        "V2: editable images and prepared videos, timed against the narration. V3: media the\n"
+        "pipeline downloaded/extracted but could not confidently time against the narration\n"
+        "('UNSYNCED ...' clips) - reposition these by hand; they are already the right file,\n"
+        "just not yet at the right timestamp. V1: guide cards in any gap that still has no\n"
+        "visual reference at all, or where a download genuinely failed (see warnings). A1: narration.\n"
         "A2/A3: linked source-video sound, enabled by default. Mute those clips in Premiere\n"
         "if source sound ever competes with narration.\n"
         "Timeline/Source_Selects.xml (when present): exact full requested excerpts, source sound enabled.\n"

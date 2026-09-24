@@ -151,13 +151,19 @@ def download_source(video_id, cache, ranges, handles=600, full=None, full_limit=
 
 
 def prepare_sources(cues, output, handles=600, full=None, cache=None, full_limit=5400):
-    """One cached download and one editable source window per distinct video source."""
+    """One cached download and one editable source window per distinct video source.
+
+    Downloads every recognized video reference regardless of whether its cue could be aligned
+    against the narration - alignment only decides *where on the timeline* a clip lands
+    (place_video_clips, confirmed track only), not whether the source is fetched at all. An
+    unaligned reference still gets `ref["video_asset"]` set here, so it's available for the
+    caller to place on the unconfirmed track instead of being silently skipped."""
     output = Path(output).resolve()
     output.mkdir(parents=True, exist_ok=True)
     cache = Path(cache or local_cache_dir()/"youtube")
     groups, failures, sources = {}, [], {}
     for cue in cues:
-        if cue["kind"] != "video" or cue["start"] is None:
+        if cue["kind"] != "video":
             continue
         for ref in cue["refs"]:
             try:
@@ -221,7 +227,11 @@ def prepare_sources(cues, output, handles=600, full=None, cache=None, full_limit
 
 
 def place_video_clips(cues, images, sequence_frames):
-    """Normal speed; cap main edit at its passage. Full selections remain separate."""
+    """Normal speed; cap main edit at its passage. Full selections remain separate.
+
+    Only places refs whose cue aligned against the narration (the confirmed track) - a ref
+    with a `video_asset` but no alignment is left for the caller to place on the unconfirmed
+    track instead (its `video_asset` was already set by prepare_sources regardless)."""
     edits, selects, cursor = [], [], 0
     all_cue_starts = sorted(round(c["start"]*FPS) for c in cues if c["start"] is not None)
     for cue in cues:
@@ -240,6 +250,7 @@ def place_video_clips(cues, images, sequence_frames):
             length = source_out-source_in
             base = {**asset, "name": f"VIDEO {ref['label']} | {asset['title']}",
                     "in_frame": source_in, "source_url": ref["target"], "passage": cue["passage"],
+                    "doc_order": cue.get("doc_order", 0),
                     "requested_source_start": ref["source_start"], "requested_source_end": ref["source_end"],
                     "source_notes": [ref["source_warning"]] if ref.get("source_warning") else []}
             selects.append({**base, "start_frame": cursor, "end_frame": cursor+length})

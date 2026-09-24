@@ -124,6 +124,27 @@ class VisualLinkTests(unittest.TestCase):
         self.assertEqual(found[0]["asset"], None)
         self.assertIn("HTTP 403", warnings[0])
 
+    def test_drive_link_without_img_label_is_recognized_as_image(self):
+        # A Drive share link is a common way to link an image and shouldn't need the "IMG"
+        # label workaround other unlabelled page links require.
+        raw = "Look at this drive picture here"
+        target = "https://drive.google.com/file/d/1AbCdEfGhIjKlMnOpQrStUvWxYz1234567890/view"
+        links = [{"start": raw.index("drive picture"), "end": raw.index("drive picture") + len("drive picture"), "target": target}]
+        fetched = []
+        found = visual_links(raw, links, {}, [], lambda url: fetched.append(url) or {"path": "p", "width": 1, "height": 1})
+        self.assertEqual(fetched, [target])
+        self.assertEqual(found[0]["kind"], "image")
+
+    def test_unrecognized_http_link_warns_instead_of_vanishing(self):
+        # A plain http(s) link that isn't a video, a recognized image, or a bookmark used to
+        # vanish from the output with zero trace. It should at least produce a warning now.
+        raw = "check this out here"
+        links = [{"start": raw.index("this out"), "end": raw.index("this out") + len("this out"), "target": "https://example.com/some-page"}]
+        warnings = []
+        found = visual_links(raw, links, {}, warnings, None)
+        self.assertEqual(found, [])
+        self.assertTrue(any("Unrecognized link" in w for w in warnings))
+
 
 if __name__ == "__main__":
     unittest.main()
