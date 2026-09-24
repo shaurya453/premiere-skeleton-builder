@@ -98,6 +98,14 @@ def local_cache_dir() -> Path:
     return default_data_root() / "Cache"
 
 
+def temp_dir() -> Path:
+    """Scratch space for short-lived work (e.g. a doc pre-flight check's TemporaryDirectory)
+    that would otherwise default to the OS temp folder. Kept next to the app for the same
+    "everything lives in the app folder" reason as local_cache_dir(); unlike Cache, nothing
+    here is meant to be reused between calls."""
+    return default_data_root() / "Temp"
+
+
 def ffmpeg_exe() -> str:
     """ffmpeg bundled with the app (imageio-ffmpeg), else the one on PATH."""
     try:

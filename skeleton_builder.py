@@ -26,7 +26,7 @@ from lxml import etree as ET
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from google_docs import is_google_doc_url, download_google_doc
-from paths import NO_WINDOW, cache_dir, ffmpeg_exe, local_cache_dir
+from paths import NO_WINDOW, cache_dir, ffmpeg_exe, local_cache_dir, temp_dir
 
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
       "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
@@ -265,12 +265,14 @@ def read_docx(path, assets_dir, fetch_web=True):
 def inspect_docx(path):
     """Fast pre-flight check of a DOCX script or Google Docs URL without altering output."""
     import tempfile
+    scratch = temp_dir()
+    scratch.mkdir(parents=True, exist_ok=True)
     str_path = str(path).strip()
     if is_google_doc_url(str_path):
         try:
-            with tempfile.TemporaryDirectory() as tmp_fetch:
+            with tempfile.TemporaryDirectory(dir=scratch) as tmp_fetch:
                 downloaded = download_google_doc(str_path, destination_dir=tmp_fetch)
-                with tempfile.TemporaryDirectory() as tmp:
+                with tempfile.TemporaryDirectory(dir=scratch) as tmp:
                     words, cues, embedded, warnings = read_docx(downloaded, Path(tmp), fetch_web=False)
                     image_cues = sum(1 for c in cues if c.get("kind") == "image")
                     video_cues = sum(1 for c in cues if c.get("kind") == "video")
@@ -292,7 +294,7 @@ def inspect_docx(path):
     if not path.is_file() or path.suffix.lower() != ".docx":
         return {"valid": False, "error": "Not a valid .docx file"}
     try:
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory(dir=scratch) as tmp:
             words, cues, embedded, warnings = read_docx(path, Path(tmp), fetch_web=False)
             image_cues = sum(1 for c in cues if c.get("kind") == "image")
             video_cues = sum(1 for c in cues if c.get("kind") == "video")

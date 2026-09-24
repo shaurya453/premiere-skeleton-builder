@@ -34,6 +34,15 @@ def _assert_tcl_bundled(dist_dir):
                           "in the build output) - the packaged app would fail to launch.")
 
 
+def _ship_default_folders(app_root):
+    """Create the app's default Projects/Media/Models/Cache/Temp folders right in the
+    packaged output, matching paths.py's default_data_root() (next to the .exe on Windows,
+    next to the .app bundle on macOS), so they exist the moment the app is unzipped instead
+    of only appearing after the first run creates them."""
+    for name in ("Projects", "Media", "Models", "Cache", "Temp"):
+        (app_root / name).mkdir(parents=True, exist_ok=True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--node", help="path to a Node.js executable to bundle")
@@ -69,6 +78,9 @@ def main():
 
     dist_dir = HERE / "dist" / ("Premiere Skeleton Builder.app" if mac else "SkeletonBuilder")
     _assert_tcl_bundled(dist_dir)
+    # Matches paths.app_dir(): one level above the .app bundle on macOS, the exe's own
+    # folder on Windows.
+    _ship_default_folders(dist_dir.parent if mac else dist_dir)
 
 
 if __name__ == "__main__":

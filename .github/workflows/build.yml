@@ -41,7 +41,10 @@ jobs:
         run: Compress-Archive -Path dist/SkeletonBuilder -DestinationPath "SkeletonBuilder-${{ matrix.name }}.zip"
       - name: Package (macOS)
         if: runner.os == 'macOS'
-        run: ditto -c -k --keepParent "dist/Premiere Skeleton Builder.app" "SkeletonBuilder-${{ matrix.name }}.zip"
+        # The default Projects/Media/Models/Cache/Temp folders build_app.py creates as
+        # siblings of the .app (matching paths.app_dir()) must ship alongside it, not just
+        # the .app bundle on its own.
+        run: ditto -c -k --keepParent "dist/Premiere Skeleton Builder.app" dist/Projects dist/Media dist/Models dist/Cache dist/Temp "SkeletonBuilder-${{ matrix.name }}.zip"
       - uses: actions/upload-artifact@v4
         with:
           name: SkeletonBuilder-${{ matrix.name }}
