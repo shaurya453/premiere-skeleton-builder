@@ -290,8 +290,8 @@ class BookmarkTests(unittest.TestCase):
             self.assertFalse(any("Skipped unreadable" in w for w in warnings))
 
     def test_closed_bookmark_does_not_absorb_later_image(self):
-        # A bookmark whose bookmarkEnd already closed before any image appears shouldn't
-        # attach to a later, unrelated picture.
+        # A bookmark whose bookmarkEnd already closed, with real narration text before any
+        # image appears, shouldn't attach to a later, unrelated picture.
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             Image.new("RGB", (60, 40)).save(root / "img.png")
@@ -300,6 +300,7 @@ class BookmarkTests(unittest.TestCase):
                      xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body>
                      <w:p><w:r><w:t>They found the book. (</w:t></w:r><w:hyperlink w:anchor="first"><w:r><w:t>IMG 1</w:t></w:r></w:hyperlink><w:r><w:t>)</w:t></w:r></w:p>
                      <w:bookmarkStart w:id="1" w:name="first"/><w:bookmarkEnd w:id="1"/>
+                     <w:p><w:r><w:t>Several unrelated sentences of narration follow, with no image nearby at all.</w:t></w:r></w:p>
                      <w:p><a:blip r:embed="a1"/></w:p>
                      </w:body></w:document>'''
             rels = '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
@@ -314,6 +315,33 @@ class BookmarkTests(unittest.TestCase):
             self.assertIsNone(cues[0]["refs"][0]["asset"])
             self.assertTrue(any("Bookmark 'first' was never attached to any image" in w for w in warnings))
             self.assertTrue(any("Missing bookmark/image for IMG 1: first" in w for w in warnings))
+
+    def test_google_docs_zero_width_bookmark_before_image_still_attaches(self):
+        # Google Docs cannot bookmark an inline image directly: bookmarking an image there
+        # produces a zero-width bookmark (start immediately followed by end) in an empty
+        # paragraph, with the actual picture in the very next paragraph - nothing in between.
+        # This is how real Google Docs scripts bookmark every image, so it must still attach.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            Image.new("RGB", (60, 40)).save(root / "img.png")
+            doc = '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+                     xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body>
+                     <w:p><w:r><w:t>They found the book. (</w:t></w:r><w:hyperlink w:anchor="first"><w:r><w:t>IMG 1</w:t></w:r></w:hyperlink><w:r><w:t>)</w:t></w:r></w:p>
+                     <w:p><w:bookmarkStart w:id="1" w:name="first"/><w:bookmarkEnd w:id="1"/></w:p>
+                     <w:p><a:blip r:embed="a1"/></w:p>
+                     </w:body></w:document>'''
+            rels = '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="a1" Target="media/image1.png"/></Relationships>'''
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+                z.write(root / "img.png", "word/media/image1.png")
+            words, cues, assets, warnings = read_docx(root / "script.docx", root / "assets")
+            self.assertEqual(len(assets), 1)
+            self.assertEqual(assets[0]["bookmarks"], ["first"])
+            self.assertIsNotNone(cues[0]["refs"][0]["asset"])
+            self.assertFalse(any("was never attached to any image" in w for w in warnings))
 
     def test_wrong_audio_cache_rejected(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -145,6 +145,28 @@ class VisualLinkTests(unittest.TestCase):
         self.assertEqual(found, [])
         self.assertTrue(any("Unrecognized link" in w for w in warnings))
 
+    def test_phrase_linked_straight_to_a_video_url_with_a_start_time_is_a_video_cue(self):
+        # A common real-world style: no visible timestamp range in the script text at all -
+        # a plain highlighted phrase hyperlinked straight to a YouTube share link carrying
+        # its own start-time param ("?t=256&si=..."). This used to vanish as "unrecognized".
+        raw = "he proceeds to smash both of them with a hammer"
+        span = (raw.index("smash"), raw.index("hammer") + len("hammer"))
+        target = "https://youtu.be/j_4TucM3yUk?t=459&si=Pn9d1NMIdbvPDK0e"
+        links = [{"start": span[0], "end": span[1], "target": target}]
+        warnings = []
+        found = visual_links(raw, links, {}, warnings, None)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["kind"], "video")
+        self.assertEqual(found[0]["point_start"], 459.0)
+        self.assertEqual(warnings, [])
+
+    def test_compound_youtube_timestamp_format_is_parsed(self):
+        from youtube_media import url_timestamp_seconds
+        self.assertEqual(url_timestamp_seconds("https://youtu.be/abc?t=4m19s"), 4*60+19)
+        self.assertEqual(url_timestamp_seconds("https://youtu.be/abc?t=1h2m3s"), 3600+120+3)
+        self.assertEqual(url_timestamp_seconds("https://youtu.be/abc?t=90"), 90.0)
+        self.assertIsNone(url_timestamp_seconds("https://youtu.be/abc"))
+
 
 if __name__ == "__main__":
     unittest.main()

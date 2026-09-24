@@ -53,6 +53,38 @@ def source_range(label):
     return start, end
 
 
+# A common bookmarking style hyperlinks a plain phrase straight to a video URL carrying a
+# single start-time param (e.g. a YouTube share link's "?t=256&si=..." or "?t=4m19s"), with no
+# visible timestamp range in the script text at all - source_range() has nothing to parse there.
+POINT_REFERENCE_DURATION = 3.0  # seconds; matches the default given to an unsynced image.
+
+
+def url_timestamp_seconds(url):
+    """Seconds from a video URL's start-time param (YouTube's 't'/'start', or a '#t=' fragment).
+
+    Accepts plain seconds ('t=256') or YouTube's compound format ('t=1h2m3s', 't=4m19s').
+    Returns None if the URL carries no recognizable start time.
+    """
+    parsed = urlparse(url)
+    candidates = []
+    query = parse_qs(parsed.query)
+    for key in ("t", "start"):
+        if query.get(key):
+            candidates.append(query[key][0])
+    if parsed.fragment:
+        match = re.search(r"t=([0-9hms.]+)", parsed.fragment)
+        if match:
+            candidates.append(match.group(1))
+    for raw in candidates:
+        if re.fullmatch(r"\d+(?:\.\d+)?", raw):
+            return float(raw)
+        match = re.fullmatch(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?", raw)
+        if match and any(match.groups()):
+            hours, minutes, secs = (float(g) if g else 0.0 for g in match.groups())
+            return hours * 3600 + minutes * 60 + secs
+    return None
+
+
 def source_window(ranges, duration, handles=600, full=None, full_limit=5400):
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("Source duration must be known and positive")
@@ -168,7 +200,10 @@ def prepare_sources(cues, output, handles=600, full=None, cache=None, full_limit
         for ref in cue["refs"]:
             try:
                 kind, identifier, url = identify_source(ref["target"])
-                a, b = source_range(ref["label"])
+                if "point_start" in ref:
+                    a, b = ref["point_start"], ref["point_start"] + POINT_REFERENCE_DURATION
+                else:
+                    a, b = source_range(ref["label"])
                 ref.update(video_id=identifier, source_start=a, source_end=b)
                 sources[identifier] = (kind, url)
                 groups.setdefault(identifier, []).append((cue, ref))

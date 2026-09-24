@@ -64,7 +64,7 @@ def visual_links(raw, links, bookmark_images, warnings, fetch_image=None):
     embedded picture, or an image URL / page link labelled IMG. `fetch_image(url)`
     downloads web images; without it (script inspection) they are only counted.
     """
-    from youtube_media import source_range
+    from youtube_media import source_range, url_timestamp_seconds
     from web_media import identify_source, is_direct_image_url, is_http
     from drive_audio import is_drive_url
     def video_link(target):
@@ -118,6 +118,13 @@ def visual_links(raw, links, bookmark_images, warnings, fetch_image=None):
             warnings.append(f"Missing bookmark/image for {label}: {target}")
         elif id(link) not in used and video_link(target) and re.search(r'\d+:\d{2}',label):
             warnings.append(f"Video timestamp needs a complete start/end range: {label}")
+        elif (id(link) not in used and video_link(target) and
+              (point := url_timestamp_seconds(target)) is not None):
+            # A plain phrase hyperlinked straight to a video URL that carries its own
+            # start-time param (e.g. a YouTube share link's "?t=256&si=..."), with no visible
+            # timestamp range in the script text at all - common when a team highlights the
+            # exact moment being described rather than typing out a range.
+            result.append({**link, 'kind':'video', 'asset':None, 'point_start':point})
         else:
             # Any other http(s) link that isn't part of a video timestamp range and wasn't
             # recognized as an image - surface it so a future recognition gap is a visible
@@ -181,7 +188,17 @@ def _scan_bookmarks_and_pictures(archive, root, relationships, assets_dir, bookm
     survives being re-fetched by a later findall()) so paragraphs looked up afterwards in the
     *same* root can be placed on that same axis.
     """
-    open_bookmarks, pending, order = {}, [], order_start
+    # `pending` holds bookmark names still eligible to attach to the next picture. Word wraps a
+    # bookmark tightly around whatever it names, but Google Docs cannot bookmark an inline image
+    # at all: exporting a Doc where someone bookmarked an image produces a zero-width bookmark
+    # (bookmarkStart immediately followed by bookmarkEnd) in an empty paragraph, with the actual
+    # picture in the very next paragraph - entirely outside the bookmark's start/end span. So a
+    # bookmark must stay pending past its own bookmarkEnd. What it must NOT do is keep collecting
+    # forever and glue itself onto some unrelated image many paragraphs later - so a closed
+    # bookmark is dropped from `pending` the moment real narration text (a non-blank w:t) is seen
+    # before any picture claims it; `closed` tracks which pending names have already closed
+    # (an open bookmark spanning real text, e.g. a hyperlinked phrase, is unaffected by this).
+    open_bookmarks, pending, closed, order = {}, [], set(), order_start
     for node in root.iter():
         # Every node gets its own unique, strictly increasing index - captured once here and
         # reused below (for a picture's doc_order) rather than re-reading the now-incremented
@@ -196,11 +213,13 @@ def _scan_bookmarks_and_pictures(archive, root, relationships, assets_dir, bookm
             bookmark_names_seen.add(name)
             open_bookmarks[node.get(q("w", "id"))] = name
         elif node.tag == q("w", "bookmarkEnd"):
-            # A bookmark that already closed shouldn't keep absorbing a later, unrelated
-            # picture - only bookmarks still open when a picture is found should attach to it.
             name = open_bookmarks.pop(node.get(q("w", "id")), None)
             if name in pending:
-                pending.remove(name)
+                closed.add(name)
+        elif node.tag == q("w", "t") and node.text and node.text.strip():
+            if closed:
+                pending[:] = [name for name in pending if name not in closed]
+                closed.clear()
         elif node.tag in (q("a", "blip"), q("v", "imagedata")):
             is_blip = node.tag == q("a", "blip")
             embed_id = node.get(q("r", "embed")) if is_blip else node.get(q("r", "id"))
@@ -224,6 +243,7 @@ def _scan_bookmarks_and_pictures(archive, root, relationships, assets_dir, bookm
                 for name in pending:
                     bookmark_images[name] = asset
                 pending.clear()
+                closed.clear()
             except Exception as error:
                 # A format PIL can't open (e.g. an embedded WMF/EMF) shouldn't sink the
                 # whole build; skip this one picture and let the normal "Missing
@@ -308,8 +328,11 @@ def read_docx(path, assets_dir, fetch_web=True):
             # Cues separated only by punctuation or other notes share the same passage.
             anchor = link["end"] if link.get("inline") else link["start"]
             end_index = sum(1 for _, _, b in ptokens if b <= anchor)
+            ref = {"label": label, "target": link["target"], "asset": asset}
+            if "point_start" in link:
+                ref["point_start"] = link["point_start"]
             if previous is not None and previous["local_end"] == end_index and previous["kind"] == kind:
-                previous["refs"].append({"label": label, "target": link["target"], "asset": asset})
+                previous["refs"].append(ref)
                 continue
             prefix = clean[:anchor].rstrip()
             # Exclude trailing sentence punctuation: a cue after a full stop belongs to that sentence.
@@ -331,7 +354,7 @@ def read_docx(path, assets_dir, fetch_web=True):
             cue = {"kind": kind, "script_start": base + start_index, "script_end": base + end_index,
                    "local_end": end_index, "passage": re.sub(r"\s+", " ", passage).strip(),
                    "doc_order": paragraph["doc_order"],
-                   "refs": [{"label": label, "target": link["target"], "asset": asset}]}
+                   "refs": [ref]}
             cues.append(cue)
             previous = cue
     return all_script_tokens, cues, embedded, warnings
