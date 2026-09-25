@@ -8,6 +8,7 @@ import zipfile
 
 from google_docs import (
     extract_google_doc_id,
+    extract_google_doc_tab,
     is_google_doc_url,
     download_google_doc,
     _sanitize_filename,
@@ -35,6 +36,50 @@ class GoogleDocsTests(unittest.TestCase):
         self.assertIsNone(extract_google_doc_id("https://google.com/search?q=test"))
         self.assertFalse(is_google_doc_url("https://google.com/search?q=test"))
         self.assertFalse(is_google_doc_url("C:/path/to/script.docx"))
+
+    def test_extract_doc_tab(self):
+        self.assertEqual(extract_google_doc_tab(
+            "https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit?tab=t.0"), "t.0")
+        self.assertEqual(extract_google_doc_tab(
+            "https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit?tab=t.abc123&usp=sharing"), "t.abc123")
+        self.assertIsNone(extract_google_doc_tab(
+            "https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit"))
+        self.assertIsNone(extract_google_doc_tab("1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"))
+
+    def test_download_includes_tab_param_in_export_url_when_link_has_one(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("word/document.xml", "<w:document/>")
+        valid_docx_bytes = buf.getvalue()
+
+        requested_urls = []
+
+        def fake_urlopen(req, timeout=None):
+            requested_urls.append(req.full_url)
+            mock_resp = MagicMock()
+            mock_resp.geturl.return_value = req.full_url
+            mock_resp.read.side_effect = [valid_docx_bytes, b""]
+            mock_resp.headers = {}
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = False
+            return mock_resp
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                download_google_doc(
+                    "https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit?tab=t.0",
+                    destination_dir=tmp,
+                )
+        self.assertIn("tab=t.0", requested_urls[0])
+
+        requested_urls.clear()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                download_google_doc(
+                    "https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit",
+                    destination_dir=tmp,
+                )
+        self.assertNotIn("tab=", requested_urls[0])
 
     def test_sanitize_filename(self):
         self.assertEqual(_sanitize_filename("Script: Part 1/2?"), "Script_ Part 1_2_.docx")

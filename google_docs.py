@@ -10,6 +10,11 @@ import urllib.request
 import zipfile
 
 DOC_ID_REGEX = re.compile(r"(?:/document/(?:u/\d+/)?d/|^)([a-zA-Z0-9_-]{25,})")
+# A Google Doc with multiple tabs puts the open tab's id in the URL, e.g. "?tab=t.0" or
+# "?tab=t.abc123xyz". Google's docx export endpoint honors this same param to restrict the
+# export to just that one tab - without it, export returns every tab's content concatenated
+# into one document.xml, which is almost never what a link pointing at one specific tab means.
+TAB_ID_REGEX = re.compile(r"[?&]tab=([a-zA-Z0-9_.-]+)")
 
 
 def is_google_doc_url(url_or_id: str) -> bool:
@@ -24,6 +29,12 @@ def extract_google_doc_id(url_or_id: str) -> str | None:
     """Extract Google Doc ID from URL or return the ID if already clean."""
     text = (url_or_id or "").strip()
     match = DOC_ID_REGEX.search(text)
+    return match.group(1) if match else None
+
+
+def extract_google_doc_tab(url_or_id: str) -> str | None:
+    """Extract a tab id (e.g. "t.0") from a Google Docs URL's "tab=" param, if present."""
+    match = TAB_ID_REGEX.search((url_or_id or "").strip())
     return match.group(1) if match else None
 
 
@@ -63,6 +74,12 @@ def download_google_doc(
 ) -> Path:
     """Download a Google Doc as a .docx file using Google's direct export endpoint.
 
+    If the URL points at one tab of a multi-tab doc (a "?tab=t.xxx" param, present whenever
+    a specific tab was open when the link was copied), only that tab is exported - not the
+    whole document. Without this, Google's export concatenates every tab's content into one
+    document.xml, which silently mixes unrelated tabs (old drafts, notes, other scripts) into
+    the narration text.
+
     Parameters:
         url_or_id: The Google Docs link (e.g. https://docs.google.com/document/d/.../edit)
                    or a document ID.
@@ -90,6 +107,10 @@ def download_google_doc(
         )
 
     export_url = f"https://docs.google.com/document/d/{doc_id}/export?format=docx"
+    tab_id = extract_google_doc_tab(url_or_id)
+    if tab_id:
+        export_url += f"&tab={urllib.parse.quote(tab_id)}"
+        progress(f"Link points at one tab ({tab_id}); exporting only that tab, not the whole document.")
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
