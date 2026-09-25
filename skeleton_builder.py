@@ -34,6 +34,12 @@ NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
       "v": "urn:schemas-microsoft-com:vml"}
 FPS = 30000 / 1001
 TOKEN = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
+# Google Docs generates its own internal bookmarks (heading anchors, table-of-contents entries,
+# and - notably - one per open suggestion/tracked-change range) with a leading underscore; a
+# bookmark someone actually inserted via Insert > Bookmark never has one. A doc with active
+# suggestions can carry hundreds of these, and none of them were ever meant to attach to an
+# image, so warning about each one buries the warnings that are actually actionable.
+GOOGLE_AUTO_BOOKMARK = re.compile(r"^_[0-9a-z]{6,}$")
 
 
 def q(prefix, name):
@@ -69,7 +75,8 @@ def visual_links(raw, links, bookmark_images, warnings, fetch_image=None):
     from drive_audio import is_drive_url
     def video_link(target):
         return is_http(target) and not is_direct_image_url(target)
-    ranges = list(re.finditer(r"\d+:\d{2}(?::\d{2})?(?:\.\d+)?\s*[-–—]\s*\d+:\d{2}(?::\d{2})?(?:\.\d+)?", raw))
+    # A range's separator is usually a dash, but "0:00 to 0:07" (the word "to") is also common.
+    ranges = list(re.finditer(r"\d+:\d{2}(?::\d{2})?(?:\.\d+)?\s*(?:[-–—]|\bto\b)\s*\d+:\d{2}(?::\d{2})?(?:\.\d+)?", raw))
     result = []
     used = set()
     for match in ranges:
@@ -116,15 +123,17 @@ def visual_links(raw, links, bookmark_images, warnings, fetch_image=None):
             # embedded image, regardless of whether the label text says "IMG" - surface it
             # instead of silently dropping the cue.
             warnings.append(f"Missing bookmark/image for {label}: {target}")
-        elif id(link) not in used and video_link(target) and re.search(r'\d+:\d{2}',label):
-            warnings.append(f"Video timestamp needs a complete start/end range: {label}")
         elif (id(link) not in used and video_link(target) and
               (point := url_timestamp_seconds(target)) is not None):
-            # A plain phrase hyperlinked straight to a video URL that carries its own
-            # start-time param (e.g. a YouTube share link's "?t=256&si=..."), with no visible
-            # timestamp range in the script text at all - common when a team highlights the
-            # exact moment being described rather than typing out a range.
+            # The URL itself carries a usable start time (e.g. a YouTube share link's
+            # "?t=256&si=..."), so use it regardless of what the visible label looks like -
+            # a plain phrase with no timestamp text at all, a single-point caption like
+            # "Link at 00:03" or "02:28" (not a range, but still just one clock reading), or
+            # anything else. The label's own text is never a more reliable source of truth
+            # than the link's actual target once the target resolves to a real timestamp.
             result.append({**link, 'kind':'video', 'asset':None, 'point_start':point})
+        elif id(link) not in used and video_link(target) and re.search(r'\d+:\d{2}',label):
+            warnings.append(f"Video timestamp needs a complete start/end range: {label}")
         else:
             # Any other http(s) link that isn't part of a video timestamp range and wasn't
             # recognized as an image - surface it so a future recognition gap is a visible
@@ -282,7 +291,8 @@ def read_docx(path, assets_dir, fetch_web=True):
                     bookmark_images, embedded, warnings, order_start=order_counter)
 
         for name in sorted(bookmark_names_seen - bookmark_images.keys()):
-            warnings.append(f"Bookmark '{name}' was never attached to any image")
+            if not GOOGLE_AUTO_BOOKMARK.match(name):
+                warnings.append(f"Bookmark '{name}' was never attached to any image")
 
         paragraphs = []
         for p in root.findall(".//w:p", NS):
@@ -460,11 +470,40 @@ def timed_tokens(words_path, audio):
     return fine, "local word timestamps (faster-whisper)", []
 
 
+def _describe_unmatched_regions(script_tokens, mapping, min_run=150, limit=5):
+    """Find the largest contiguous stretches of script_tokens with no match in the narration
+    at all, and describe each with its size and a snippet of its opening words - concrete
+    pointers to exactly which part of the script doesn't belong (an old draft, notes, a
+    different tab's content), rather than one opaque percentage covering the whole document.
+    """
+    runs, start = [], None
+    for i in range(len(script_tokens) + 1):
+        unmatched = i < len(script_tokens) and i not in mapping
+        if unmatched and start is None:
+            start = i
+        elif not unmatched and start is not None:
+            if i - start >= min_run:
+                runs.append((start, i))
+            start = None
+    runs.sort(key=lambda r: r[1] - r[0], reverse=True)
+    if not runs:
+        return ""
+    total = len(script_tokens)
+    lines = ["Largest unmatched stretches (likely another tab's content, an old draft, or "
+             "editorial notes mixed into the script - not something the pipeline can fix on its own):"]
+    for a, b in runs[:limit]:
+        snippet = " ".join(script_tokens[a:a + 12])
+        lines.append(f"  - words {a:,}-{b:,} ({b - a:,} words, {(b - a) / total:.0%} of the script): \"{snippet}...\"")
+    return "\n".join(lines)
+
+
 def align_cues(script_tokens, cues, narration):
     mapping = token_mapping(script_tokens, [w["token"] for w in narration])
     coverage = len(mapping) / max(1, len(script_tokens))
     if coverage < .65:
-        raise ValueError(f"Script/audio token match is only {coverage:.0%}; refusing to guess a whole timeline.")
+        detail = _describe_unmatched_regions(script_tokens, mapping)
+        raise ValueError(f"Script/audio token match is only {coverage:.0%}; refusing to guess a whole timeline."
+                          + (f"\n{detail}" if detail else ""))
     mapped = sorted(mapping)
     for cue in cues:
         a, b = cue["script_start"], cue["script_end"]

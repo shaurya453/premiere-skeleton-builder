@@ -35,7 +35,8 @@ def youtube_id(url):
 
 
 def source_range(label):
-    pattern = r"(\d+:\d{2}(?::\d{2})?(?:\.\d+)?)\s*[-–—]\s*(\d+:\d{2}(?::\d{2})?(?:\.\d+)?)"
+    # A range's separator is usually a dash, but "0:00 to 0:07" (the word "to") is also common.
+    pattern = r"(\d+:\d{2}(?::\d{2})?(?:\.\d+)?)\s*(?:[-–—]|\bto\b)\s*(\d+:\d{2}(?::\d{2})?(?:\.\d+)?)"
     match = re.search(pattern, label)
     if not match:
         raise ValueError(f"An explicit start/end range is required: {label}")

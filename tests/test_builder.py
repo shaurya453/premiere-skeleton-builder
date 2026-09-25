@@ -8,7 +8,7 @@ from zipfile import ZipFile
 from lxml import etree as ET
 from PIL import Image
 
-from skeleton_builder import read_docx, timed_tokens, xml_sequence, inspect_docx, preview_cues, build
+from skeleton_builder import read_docx, timed_tokens, xml_sequence, inspect_docx, preview_cues, build, align_cues
 
 
 class BookmarkTests(unittest.TestCase):
@@ -343,6 +343,29 @@ class BookmarkTests(unittest.TestCase):
             self.assertIsNotNone(cues[0]["refs"][0]["asset"])
             self.assertFalse(any("was never attached to any image" in w for w in warnings))
 
+    def test_google_auto_generated_bookmarks_are_not_warned_about(self):
+        # A doc with active suggestions (Google Docs "Suggesting" mode) carries one internal,
+        # underscore-prefixed bookmark per suggestion range, plus others for heading anchors -
+        # none of these were ever meant to attach to an image, so warning about each one (a
+        # real doc can have hundreds) buries the warnings that are actually actionable. A
+        # bookmark someone actually inserted (no leading underscore) should still warn.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            doc = '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>
+                     <w:p><w:bookmarkStart w:id="1" w:name="_1a2b3c4d5e6f"/><w:bookmarkEnd w:id="1"/>
+                     <w:r><w:t>Some narration text with nothing bookmarked nearby.</w:t></w:r></w:p>
+                     <w:p><w:bookmarkStart w:id="2" w:name="realUserBookmark9"/><w:bookmarkEnd w:id="2"/>
+                     <w:r><w:t>More narration, again with no image nearby.</w:t></w:r></w:p>
+                     </w:body></w:document>'''
+            rels = '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"/>'
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+            words, cues, assets, warnings = read_docx(root / "script.docx", root / "assets")
+            self.assertFalse(any("_1a2b3c4d5e6f" in w for w in warnings))
+            self.assertTrue(any("realUserBookmark9" in w and "never attached" in w for w in warnings))
+
     def test_wrong_audio_cache_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -364,6 +387,28 @@ class BookmarkTests(unittest.TestCase):
             self.assertEqual(fine[1]["start"], 0.6)
             with self.assertRaisesRegex(ValueError, "required"):
                 timed_tokens(None, root / "audio")
+
+
+class AlignmentDiagnosticsTests(unittest.TestCase):
+    def test_low_coverage_error_points_at_the_unmatched_stretch(self):
+        # A script with real narration followed by a long stretch of unrelated text (an old
+        # draft, notes, another tab's content pulled in by mistake) should fail with a message
+        # that names roughly where the bad stretch starts and what it says - not just a bare
+        # percentage the user has to go spelunking in the XML to explain.
+        matched = [f"word{i}" for i in range(40)]
+        junk = [f"junk{i}" for i in range(200)]
+        script_tokens = matched + junk
+        narration = [{"token": t, "start": i, "end": i + 1} for i, t in enumerate(matched)]
+        with self.assertRaises(ValueError) as ctx:
+            align_cues(script_tokens, [], narration)
+        message = str(ctx.exception)
+        self.assertIn("%", message)
+        self.assertIn("junk0 junk1", message)
+
+    def test_well_matched_script_does_not_raise(self):
+        script_tokens = [f"word{i}" for i in range(40)]
+        narration = [{"token": t, "start": i, "end": i + 1} for i, t in enumerate(script_tokens)]
+        align_cues(script_tokens, [], narration)  # should not raise
 
 
 class UnconfirmedTrackTests(unittest.TestCase):

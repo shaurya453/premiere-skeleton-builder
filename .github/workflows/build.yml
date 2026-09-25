@@ -5,7 +5,11 @@ name: Build apps
 on:
   workflow_dispatch:
   push:
+    branches: ["main"]
     tags: ["v*"]
+
+permissions:
+  contents: write  # needed to publish/update the rolling "latest" release the app updates from
 
 jobs:
   build:
@@ -55,3 +59,18 @@ jobs:
         with:
           name: SkeletonBuilder-${{ matrix.name }}
           path: SkeletonBuilder-${{ matrix.name }}.zip
+      - name: Publish to the rolling "latest" release
+        # The app's in-app updater fetches from a GitHub Release, not an Actions artifact -
+        # artifacts require an authenticated token to download even on a public repo, so a
+        # shipped app has no way to fetch one. Releases are public and unauthenticated. Gated
+        # to main so a stray branch build never overwrites what editors update to.
+        if: github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create latest --repo "$GITHUB_REPOSITORY" --title "Latest build" \
+              --notes "commit:${{ github.sha }}" --target "${{ github.sha }}" --prerelease || true
+          gh release edit latest --repo "$GITHUB_REPOSITORY" --notes "commit:${{ github.sha }}" --target "${{ github.sha }}"
+          gh release upload latest --repo "$GITHUB_REPOSITORY" "SkeletonBuilder-${{ matrix.name }}.zip" --clobber

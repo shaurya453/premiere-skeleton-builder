@@ -24,6 +24,8 @@ from jobs import (ROOT, SETTINGS, DEFAULT_PROJECTS, DEFAULT_MEDIA, DEFAULT_MODEL
 from skeleton_builder import inspect_docx, preview_cues
 from google_docs import is_google_doc_url, download_google_doc
 from drive_audio import is_drive_url
+from paths import FROZEN
+import updater
 
 PRESETS = {
     "YouTube 1080p Standard (16:9 @ 29.97 fps)": {"width": 1920, "height": 1080, "limit": 90, "handles": 10},
@@ -156,9 +158,11 @@ def main(smoke_test: bool = False):
     build_tab = ttk.Frame(tabs, padding=14)
     runs_tab = ttk.Frame(tabs, padding=14)
     paths_tab = ttk.Frame(tabs, padding=14)
+    update_tab = ttk.Frame(tabs, padding=14)
     tabs.add(build_tab, text="  Build  ")
     tabs.add(runs_tab, text="  Runs  ")
     tabs.add(paths_tab, text="  Paths & Options  ")
+    tabs.add(update_tab, text="  Update  ")
 
     # ---------------- Paths & Options tab (settings live here) ----------------
     settings_vars = {
@@ -701,6 +705,124 @@ def main(smoke_test: bool = False):
     retry_btn = ttk.Button(button_row, text="⟳  Retry script & audio fetch", command=retry_run, padding=(10, 5))
     retry_btn.pack(side="left")
 
+    # ---------------- Update tab ----------------
+    version_group = ttk.LabelFrame(update_tab, text=" Version ", padding=12)
+    version_group.pack(fill="x")
+    current_full_commit = updater.current_commit()
+    ttk.Label(version_group, text=f"Current version: {current_full_commit[:7]}",
+              font=(UI_FONT, 10, "bold")).pack(anchor="w")
+    ttk.Label(version_group, text=current_full_commit, foreground=MUTED, font=(UI_FONT, 9)).pack(anchor="w")
+
+    update_group = ttk.LabelFrame(update_tab, text=" Update ", padding=12)
+    update_group.pack(fill="x", pady=(12, 0))
+    update_status_var = tk.StringVar(value="Checking for updates…" if FROZEN else
+                                      "Updates are only available in the packaged app.")
+    ttk.Label(update_group, textvariable=update_status_var, foreground=MUTED).pack(anchor="w", pady=(0, 8))
+    update_btn = ttk.Button(update_group, text="⬆  Update Now", state="disabled")
+    update_btn.pack(anchor="w")
+    update_progress_var = tk.StringVar(value="")
+    ttk.Label(update_group, textvariable=update_progress_var, foreground=MUTED).pack(anchor="w", pady=(6, 0))
+
+    update_info = [{}]
+    updating = [False]
+
+    def blocking_reason():
+        """Why Update Now should stay disabled right now, or None if it's clear to update -
+        the update must not run while literally anything else in the app is active."""
+        if updating[0]:
+            return "Update already in progress…"
+        if resolving[0]:
+            return "Waiting for the script/audio fetch to finish…"
+        if read_queue():
+            return "Queued build(s) waiting — clear the queue first."
+        if any(r["display_status"] in ("Running", "Starting") for r in runs(settings_vars["projects_dir"].get().strip() or None)):
+            return "A build is currently running."
+        return None
+
+    def update_button_state():
+        """Cheap, local-only recheck (no network) - safe to call on every poll() tick so the
+        button reacts immediately to a build starting/finishing elsewhere in the app."""
+        if not FROZEN:
+            update_btn.configure(state="disabled")
+            return
+        reason = blocking_reason()
+        info = update_info[0]
+        if reason:
+            update_btn.configure(state="disabled")
+            if not updating[0]:
+                update_progress_var.set(reason)
+        elif info.get("available"):
+            update_btn.configure(state="normal")
+            update_progress_var.set("")
+        else:
+            update_btn.configure(state="disabled")
+
+    def check_for_updates():
+        if not FROZEN:
+            return
+
+        def worker():
+            info = updater.update_available()
+            def done():
+                update_info[0] = info
+                if info.get("error"):
+                    update_status_var.set(f"Couldn't check for updates: {info['error']}")
+                elif info.get("available"):
+                    update_status_var.set(f"Update available: {info['latest'][:7]} (current: {info['current'][:7]})")
+                else:
+                    update_status_var.set(f"Up to date (commit {info['current'][:7]})")
+                update_button_state()
+            window.after(0, done)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def do_update():
+        reason = blocking_reason()
+        if reason:
+            messagebox.showwarning("Cannot update", reason)
+            return
+        info = update_info[0]
+        if not info.get("available"):
+            return
+        if not messagebox.askyesno("Update Skeleton Builder",
+                f"This will close and restart Skeleton Builder to install version {info['latest'][:7]}.\n\n"
+                "Your Projects, Media, Models and Cache folders are not affected.\n\nContinue?"):
+            return
+        updating[0] = True
+        update_btn.configure(state="disabled")
+        update_progress_var.set("Starting update…")
+
+        def worker():
+            try:
+                zip_path = updater.download_update(info["asset_url"],
+                    progress=lambda m: window.after(0, lambda: update_progress_var.set(m)))
+                window.after(0, lambda: update_progress_var.set("Restarting…"))
+                updater.launch_updater_and_exit(zip_path)
+                window.after(200, window.destroy)
+            except Exception as error:
+                def failed():
+                    updating[0] = False
+                    update_progress_var.set(f"Update failed: {error}")
+                    update_button_state()
+                window.after(0, failed)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    update_btn.configure(command=do_update)
+    check_for_updates()
+
+    def update_poll():
+        try:
+            if not window.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        check_for_updates()
+        window.after(10 * 60 * 1000, update_poll)  # 10 min - a GitHub API call, keep it infrequent
+
+    if FROZEN:
+        window.after(10 * 60 * 1000, update_poll)
+
     # ---------------- Runs tab ----------------
     tree = ttk.Treeview(runs_tab, columns=("status", "date"), height=6)
     tree.heading("#0", text="Project")
@@ -791,6 +913,7 @@ def main(smoke_test: bool = False):
         retry_status = ("Failed — see log", "Interrupted / incomplete")
         can_retry = bool(r) and not running and not resolving[0] and r["display_status"] in retry_status and r.get("config")
         retry_btn.configure(state="normal" if can_retry else "disabled")
+        update_button_state()
         if not r:
             return
         log_path = Path(r["folder"]) / "run.log"

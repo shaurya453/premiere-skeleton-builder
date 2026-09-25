@@ -63,17 +63,41 @@ def _ship_default_folders(app_root):
         (app_root / name).mkdir(parents=True, exist_ok=True)
 
 
+def _write_version_file():
+    """Bake the commit this build was made from into the frozen app, so it can tell the
+    in-app updater what version it is. Read back at runtime via paths.BUNDLE/"VERSION.txt"
+    (paths.py's BUNDLE already points at PyInstaller's bundle dir, or the repo root when not
+    frozen). Falls back to "unknown" rather than failing the build if this isn't a git
+    checkout for some reason.
+
+    Written outside HERE/"build" deliberately: that's PyInstaller's --workpath/--specpath
+    below, and --clean wipes it before packaging - a file written there would be deleted
+    before --add-data could bundle it."""
+    try:
+        commit = subprocess.run(["git", "rev-parse", "HEAD"], cwd=HERE, capture_output=True,
+                                 text=True, check=True).stdout.strip()
+    except Exception:
+        commit = "unknown"
+    version_dir = HERE / "build_version"
+    version_dir.mkdir(parents=True, exist_ok=True)
+    version_file = version_dir / "VERSION.txt"
+    version_file.write_text(commit)
+    return version_file
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--node", help="path to a Node.js executable to bundle")
     args = parser.parse_args()
     mac = sys.platform == "darwin"
+    version_file = _write_version_file()
     options = [
         str(HERE / "skeleton_app.py"),
         "--name", "Premiere Skeleton Builder" if mac else "SkeletonBuilder",
         "--noconfirm", "--clean", "--windowed", "--onedir",
         "--distpath", str(HERE / "dist"), "--workpath", str(HERE / "build"), "--specpath", str(HERE / "build"),
         "--paths", str(HERE),
+        "--add-data", f"{version_file}{os.pathsep}.",
         "--collect-all", "faster_whisper", "--collect-all", "ctranslate2", "--collect-all", "onnxruntime",
         "--collect-all", "tkinterdnd2", "--collect-all", "imageio_ffmpeg",
         "--collect-all", "yt_dlp", "--collect-all", "yt_dlp_ejs",
@@ -81,6 +105,7 @@ def main():
         "--collect-data", "certifi",  # cacert.pem: macOS frozen builds need this for HTTPS to verify at all
         "--hidden-import", "web_media", "--hidden-import", "drive_audio", "--hidden-import", "transcribe_words",
         "--hidden-import", "job_worker", "--hidden-import", "skeleton_builder", "--hidden-import", "app",
+        "--hidden-import", "updater",
         "--exclude-module", "torch", "--exclude-module", "matplotlib", "--exclude-module", "IPython",
     ]
     if mac:

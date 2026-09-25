@@ -160,6 +160,46 @@ class VisualLinkTests(unittest.TestCase):
         self.assertEqual(found[0]["point_start"], 459.0)
         self.assertEqual(warnings, [])
 
+    def test_single_point_clock_label_prefers_the_url_timestamp_over_the_range_warning(self):
+        # A single-point caption in the visible text ("Link at 00:03", or a bare "02:28")
+        # still matches the old "digit:digit" incomplete-range check, but it isn't a range at
+        # all - it's one clock reading, and the URL backing it already carries the same start
+        # time ("?t=3"). The URL should win over guessing from the label text.
+        raw = "Cameron Taylor was born in 1999. Link at 00:03"
+        span = (raw.index("Link at 00:03"), raw.index("Link at 00:03") + len("Link at 00:03"))
+        target = "https://youtu.be/jyj4v06YTy4?si=0DjtAh4-_13hDixF&t=3"
+        links = [{"start": span[0], "end": span[1], "target": target}]
+        warnings = []
+        found = visual_links(raw, links, {}, warnings, None)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["kind"], "video")
+        self.assertEqual(found[0]["point_start"], 3.0)
+        self.assertEqual(warnings, [])
+
+    def test_bare_clock_label_with_no_matching_url_timestamp_still_warns(self):
+        raw = "Cameron Taylor was born in 1999. 02:28"
+        span = (raw.index("02:28"), raw.index("02:28") + len("02:28"))
+        target = "https://youtu.be/jyj4v06YTy4?si=0DjtAh4-_13hDixF"  # no t= param at all
+        links = [{"start": span[0], "end": span[1], "target": target}]
+        warnings = []
+        found = visual_links(raw, links, {}, warnings, None)
+        self.assertEqual(found, [])
+        self.assertTrue(any("complete start/end range" in w for w in warnings))
+
+    def test_range_written_with_the_word_to_instead_of_a_dash(self):
+        # "0:00 to 0:07" is as common a range style as a dash-separated one and carries no
+        # URL timestamp to fall back on (these usually start at the very beginning of the
+        # video, so the share link often has no "t=" param at all).
+        raw = "clip from 0:00 to 0:07 shows this"
+        span = (raw.index("0:00 to 0:07"), raw.index("0:00 to 0:07") + len("0:00 to 0:07"))
+        target = "https://youtu.be/mbBtxBd4U3A?si=v7Ay5uzDXis1RMin"
+        links = [{"start": span[0], "end": span[1], "target": target}]
+        warnings = []
+        found = visual_links(raw, links, {}, warnings, None)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["kind"], "video")
+        self.assertEqual(warnings, [])
+
     def test_compound_youtube_timestamp_format_is_parsed(self):
         from youtube_media import url_timestamp_seconds
         self.assertEqual(url_timestamp_seconds("https://youtu.be/abc?t=4m19s"), 4*60+19)

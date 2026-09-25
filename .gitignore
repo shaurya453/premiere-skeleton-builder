@@ -23,6 +23,7 @@ DEVELOPMENT-NOTES.md
 # Build output
 dist/
 build/
+build_version/
 *.spec
 startup_err.log
 

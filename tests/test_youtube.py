@@ -20,6 +20,8 @@ class YouTubeTests(unittest.TestCase):
         self.assertEqual(source_range('2:15 - 2:21'), (135, 141))
         self.assertEqual(source_range('0:54–0:55'), (54, 55))
         self.assertEqual(source_range('1:02:03 — 1:02:05'), (3723, 3725))
+        self.assertEqual(source_range('0:00 to 0:07'), (0, 7))
+        self.assertEqual(source_range('5:19 to 5:23'), (319, 323))
         self.assertEqual(source_window([(135,141)],333,30,False), (105,171))
         self.assertEqual(source_window([(6,10),(90,95)],100,30,False), (0,100))
         self.assertEqual(source_window([(135,141)],333,30,True), (0,333))
