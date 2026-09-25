@@ -71,6 +71,6 @@ jobs:
         run: |
           gh release view latest --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
             gh release create latest --repo "$GITHUB_REPOSITORY" --title "Latest build" \
-              --notes "commit:${{ github.sha }}" --target "${{ github.sha }}" --prerelease || true
+              --notes "commit:${{ github.sha }}" --target "${{ github.sha }}" || true
           gh release edit latest --repo "$GITHUB_REPOSITORY" --notes "commit:${{ github.sha }}" --target "${{ github.sha }}"
           gh release upload latest --repo "$GITHUB_REPOSITORY" "SkeletonBuilder-${{ matrix.name }}.zip" --clobber
