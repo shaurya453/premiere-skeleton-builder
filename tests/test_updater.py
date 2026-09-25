@@ -70,6 +70,29 @@ class CurrentCommitTests(unittest.TestCase):
         self.assertTrue(commit == "unknown" or len(commit) == 40)
 
 
+class StageWindowsHelperTests(unittest.TestCase):
+    def test_stages_only_app_files_outside_install_dir(self):
+        # The staged helper must never run out of install_dir itself (see updater.py's
+        # module docstring for why - Windows demand-pages a running process's own code from
+        # its backing files) and must never copy Projects/Media/etc, which can be large.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            install_dir = root / "SkeletonBuilder"
+            (install_dir / "_internal").mkdir(parents=True)
+            (install_dir / "_internal" / "a.dll").write_text("dll")
+            (install_dir / "SkeletonBuilder.exe").write_text("exe")
+            (install_dir / "Projects").mkdir()
+            (install_dir / "Projects" / "user_data.txt").write_text("must not be copied")
+
+            with patch.object(updater, "cache_dir", return_value=root / "cache"):
+                helper_exe = updater._stage_windows_helper(install_dir)
+
+            self.assertEqual(helper_exe, root / "cache" / "update_helper" / "SkeletonBuilder.exe")
+            self.assertEqual(helper_exe.read_text(), "exe")
+            self.assertEqual((helper_exe.parent / "_internal" / "a.dll").read_text(), "dll")
+            self.assertFalse((helper_exe.parent / "Projects").exists())
+
+
 class FinishUpdateTests(unittest.TestCase):
     def test_preserves_user_folders_and_replaces_app_files_windows_style(self):
         # Exercise the Windows branch of finish_update's file swap directly (skip the mac

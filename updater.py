@@ -6,6 +6,14 @@ skeleton_app.py's "--finish-update" mode. The actual file swap in finish_update(
 from a *freshly launched, detached* copy of the app (the same frozen executable, re-invoked
 with a hidden flag - see skeleton_app.py), after the old process has exited, so it never
 fights the running app for its own open file handles and needs no separate helper script.
+
+On Windows specifically, that helper copy is staged to a throwaway folder outside
+install_dir first (see _stage_windows_helper) rather than launched straight out of
+install_dir - Windows demand-pages a running process's own code from its backing files, so
+a helper that kept running out of install_dir/_internal while finish_update() replaces that
+same _internal folder could die at the OS level mid-swap, before ever reaching a Python
+except block to log it. macOS doesn't need this: POSIX keeps serving an open file's old
+content after it's unlinked/replaced, so running from the bundle being replaced is safe.
 """
 from __future__ import annotations
 
@@ -121,17 +129,41 @@ def _mac_app_bundle_path():
     raise RuntimeError("Could not locate the .app bundle from the running executable")
 
 
+def _stage_windows_helper(install_dir):
+    """Copy just the app's own files (never Projects/Media/etc.) to a throwaway folder
+    outside install_dir, and return the staged exe's path.
+
+    Windows demand-pages a running process's code from its backing files as execution
+    continues (unlike POSIX unlink, which keeps serving an open file's old content after
+    it's replaced) - so a helper that keeps running out of install_dir/_internal while
+    finish_update() deletes/replaces that same _internal folder can crash at the OS level
+    mid-swap, without ever reaching a Python except block to log it. Running the helper
+    from a separate staged copy instead means it never touches its own loaded files."""
+    helper_dir = cache_dir() / "update_helper"
+    if helper_dir.exists():
+        shutil.rmtree(helper_dir, ignore_errors=True)
+    helper_dir.mkdir(parents=True)
+    shutil.copytree(install_dir / "_internal", helper_dir / "_internal")
+    shutil.copy2(install_dir / "SkeletonBuilder.exe", helper_dir / "SkeletonBuilder.exe")
+    return helper_dir / "SkeletonBuilder.exe"
+
+
 def launch_updater_and_exit(zip_path):
     """Called by the running (old) app once the update is downloaded and confirmed: launches
-    a detached copy of this same executable in --finish-update mode, which will wait for this
-    process to exit and then do the actual swap. Caller must exit right after (e.g.
-    window.destroy() then sys.exit()) - this only spawns the helper, it doesn't wait."""
-    install_dir = str(_mac_app_bundle_path() if sys.platform == "darwin" else app_dir())
+    a detached helper in --finish-update mode, which will wait for this process to exit and
+    then do the actual swap. Caller must exit right after (e.g. window.destroy() then
+    sys.exit()) - this only spawns the helper, it doesn't wait."""
+    install_dir = _mac_app_bundle_path() if sys.platform == "darwin" else app_dir()
     options = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
                if os.name == "nt" else {"start_new_session": True})
-    launcher = ([sys.executable, "--finish-update", str(zip_path), install_dir, str(os.getpid())] if FROZEN
-                else [sys.executable, str(ROOT / "skeleton_app.py"), "--finish-update",
-                      str(zip_path), install_dir, str(os.getpid())])
+    if FROZEN and os.name == "nt":
+        helper_exe = _stage_windows_helper(install_dir)
+        launcher = [str(helper_exe), "--finish-update", str(zip_path), str(install_dir), str(os.getpid())]
+    elif FROZEN:
+        launcher = [sys.executable, "--finish-update", str(zip_path), str(install_dir), str(os.getpid())]
+    else:
+        launcher = [sys.executable, str(ROOT / "skeleton_app.py"), "--finish-update",
+                    str(zip_path), str(install_dir), str(os.getpid())]
     _log(f"Launching updater: {launcher}")
     subprocess.Popen(launcher, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                       stderr=subprocess.DEVNULL, **options)
@@ -180,27 +212,17 @@ def finish_update(zip_path, install_dir, old_pid, wait_timeout=30):
                 shutil.rmtree(install_dir)
             subprocess.run(["ditto", str(new_app), str(install_dir)], check=True)
             relaunch = ["open", str(install_dir)]
-            backup_dir = None
         else:
+            # Safe to replace install_dir's own files in place here: launch_updater_and_exit
+            # stages this helper as a copy running from cache_dir()/update_helper, never from
+            # install_dir itself, so this process never touches its own loaded exe/DLLs.
             new_root = next(extract_dir.iterdir())  # the single "SkeletonBuilder" folder
             old_internal = install_dir / "_internal"
-            old_exe = install_dir / "SkeletonBuilder.exe"
-            # This helper process is itself launched as a copy of old_exe (see
-            # launch_updater_and_exit), so old_exe/_internal are this process's own running
-            # image and loaded DLLs. Windows blocks opening those for in-place overwrite, but
-            # (like most self-updating Windows apps) permits renaming/deleting them
-            # (FILE_SHARE_DELETE) - so rename them aside first, then copy the new files in
-            # under the original names, then best-effort clean up the renamed originals.
-            backup_dir = install_dir / "_update_old"
-            if backup_dir.exists():
-                shutil.rmtree(backup_dir, ignore_errors=True)
-            backup_dir.mkdir()
             if old_internal.exists():
-                os.replace(old_internal, backup_dir / "_internal")
-            os.replace(old_exe, backup_dir / "SkeletonBuilder.exe")
+                shutil.rmtree(old_internal)
             shutil.copytree(new_root / "_internal", old_internal)
-            shutil.copy2(new_root / "SkeletonBuilder.exe", old_exe)
-            relaunch = [str(old_exe)]
+            shutil.copy2(new_root / "SkeletonBuilder.exe", install_dir / "SkeletonBuilder.exe")
+            relaunch = [str(install_dir / "SkeletonBuilder.exe")]
 
         _log(f"Update applied; relaunching: {relaunch}")
         options = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
@@ -208,8 +230,6 @@ def finish_update(zip_path, install_dir, old_pid, wait_timeout=30):
         subprocess.Popen(relaunch, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL, **options)
 
-        if backup_dir is not None:
-            shutil.rmtree(backup_dir, ignore_errors=True)  # best-effort; a leftover is harmless
         shutil.rmtree(extract_dir, ignore_errors=True)
         zip_path.unlink(missing_ok=True)
         _log("finish_update done")
