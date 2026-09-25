@@ -68,8 +68,13 @@ If a run fails (e.g. a network hiccup while fetching the script or voiceover), s
 Download the zip for your computer from the GitHub **Actions** tab (workflow "Build apps"):
 
 - **Windows:** unzip, run `SkeletonBuilder.exe` (keep it inside its folder).
-- **macOS:** unzip, drag `Premiere Skeleton Builder.app` to Applications. It is not signed, so the
-  first time use right-click > Open (or `xattr -cr "/Applications/Premiere Skeleton Builder.app"`).
+- **macOS:** unzip, drag `Premiere Skeleton Builder.app` to Applications. It has no Apple
+  Developer ID (that needs a paid account), so macOS still flags it as downloaded; the first time,
+  right-click > Open (or `xattr -cr "/Applications/Premiere Skeleton Builder.app"`) instead of a
+  plain double-click. If you instead see **"is damaged and can't be opened, move it to the Trash"**
+  with no Open option at all, that's a stale build from before this app started ad-hoc signing the
+  bundle - re-download the latest build, or run
+  `xattr -cr "/Applications/Premiere Skeleton Builder.app"` in Terminal, which fixes it either way.
   One build covers both Apple Silicon and Intel Macs; on an Intel Mac it runs under Rosetta 2
   (macOS installs this automatically the first time it's needed).
   Actually drag the `.app` into `/Applications` with Finder before opening it — launching it

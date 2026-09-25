@@ -8,6 +8,7 @@ PyInstaller cannot cross-compile: build on Windows for Windows and on a Mac for 
 """
 import argparse
 import os
+import subprocess
 from pathlib import Path
 import sys
 
@@ -32,6 +33,25 @@ def _assert_tcl_bundled(dist_dir):
     if not any(dist_dir.rglob("init.tcl")):
         raise SystemExit(f"Tcl/Tk was not bundled into {dist_dir} (no init.tcl found anywhere "
                           "in the build output) - the packaged app would fail to launch.")
+
+
+def _codesign_ad_hoc(app_bundle):
+    """Ad-hoc sign the whole .app bundle as one sealed unit (no Apple Developer account
+    needed - `-` is the "no identity" ad-hoc signature).
+
+    PyInstaller ad-hoc signs individual Mach-O binaries it collects (arm64 requires *some*
+    signature just to load at all), but that leaves the .app itself without a top-level seal
+    covering Info.plist and Resources. A downloaded (quarantined) app in that state fails
+    Gatekeeper's bundle-integrity check with "<app> is damaged and can't be opened - move it
+    to the Trash", which offers no override in Finder at all. Ad-hoc signing the whole bundle
+    here gives it a real seal, so the same download instead gets the ordinary "unidentified
+    developer" prompt, which right-click > Open (or Trust in System Settings) bypasses.
+    (Downloaded via a browser or unzipped from one, macOS still quarantines it either way -
+    that part is unavoidable without notarizing with a paid Apple Developer ID, so the README's
+    "right-click > Open" / `xattr -cr` instructions are still needed for a clean first launch.)
+    """
+    subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(app_bundle)], check=True)
+    subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app_bundle)], check=True)
 
 
 def _ship_default_folders(app_root):
@@ -78,6 +98,8 @@ def main():
 
     dist_dir = HERE / "dist" / ("Premiere Skeleton Builder.app" if mac else "SkeletonBuilder")
     _assert_tcl_bundled(dist_dir)
+    if mac:
+        _codesign_ad_hoc(dist_dir)
     # Matches paths.app_dir(): one level above the .app bundle on macOS, the exe's own
     # folder on Windows.
     _ship_default_folders(dist_dir.parent if mac else dist_dir)
