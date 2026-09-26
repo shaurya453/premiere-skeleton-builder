@@ -60,9 +60,18 @@ def run(folder):
             if c.get('height'): command += ['--height', str(c['height'])]
             print('Working folder:', folder, flush=True)
             print('You may close and reopen the app; this run continues in the background.', flush=True)
-            result = subprocess.run(command, stdin=subprocess.DEVNULL, **NO_WINDOW)
-            state.update(status='completed' if result.returncode == 0 else 'failed', exit_code=result.returncode)
-            print('Build completed.' if result.returncode == 0 else 'Build failed. Details are above.', flush=True)
+            builder = subprocess.Popen(command, stdin=subprocess.DEVNULL, **NO_WINDOW)
+            # Recorded immediately (before waiting) so jobs.py can find and kill this specific
+            # child if this process is later killed without it - see jobs._reap_orphan(): a
+            # plain taskkill/kill of just this pid (easy to do via Task Manager, since every
+            # stage of this pipeline shows as a generic python.exe) would otherwise leave
+            # skeleton_builder.py and its own ffmpeg children running as untracked orphans,
+            # free to race a subsequent build over the same shared download/transcription caches.
+            state['builder_pid'] = builder.pid
+            write_json(folder/'run.json', state)
+            returncode = builder.wait()
+            state.update(status='completed' if returncode == 0 else 'failed', exit_code=returncode)
+            print('Build completed.' if returncode == 0 else 'Build failed. Details are above.', flush=True)
     except BaseException as error:
         state.update(status='failed', error=str(error))
         traceback.print_exc()

@@ -52,9 +52,48 @@ def alive(pid):
         return False
 
 
+def _kill_tree(pid):
+    """Best-effort kill of pid and its descendants. On POSIX, pid doubles as the process
+    group id (job_worker.py always starts with start_new_session=True), so killing the group
+    reaches children/grandchildren (skeleton_builder.py, its ffmpeg calls) regardless of
+    whether pid itself is still alive - unlike Windows' `taskkill /T`, which needs pid itself
+    to still exist to walk its tree, which is why job_worker.py separately records its direct
+    child's own pid (state['builder_pid']) for _reap_orphan() to target below."""
+    try:
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True, **NO_WINDOW)
+        else:
+            import signal
+            os.killpg(int(pid), signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _reap_orphan(folder, state):
+    """If job_worker.py's own process died without ever updating status away from 'running'
+    (a crash, or a plain kill of just that one pid - easy to do by accident, since every stage
+    of this pipeline shows as a generic python.exe in Task Manager), the builder subprocess it
+    recorded is now an orphan: still running, still writing into the shared yt-dlp/transcription
+    caches, with nothing stopping a freshly started build from doing the same at once. Called
+    from inspect_run() so this is always checked - including via start_job()'s "already working"
+    scan - before a run is trusted as finished or a new one is allowed to start."""
+    if state.get('status') != 'running' or alive(state.get('pid')):
+        return state
+    builder_pid = state.get('builder_pid')
+    if not builder_pid or not alive(builder_pid):
+        # No live orphan actually found - leave status alone so the existing stale-pid/
+        # "Interrupted / incomplete" classification below still applies unchanged.
+        return state
+    _kill_tree(builder_pid)
+    state = {**state, 'status': 'failed', 'error': 'Build process was interrupted unexpectedly (orphaned process stopped)'}
+    write_json(Path(folder)/'run.json', state)
+    return state
+
+
 def inspect_run(folder):
     folder = Path(folder)
     state = read_json(folder/'run.json')
+    state = _reap_orphan(folder, state)
     result = Path(state.get('result', folder))
     active = state.get('status') in ('running', 'starting') and alive(state.get('pid'))
     if active:
@@ -188,15 +227,13 @@ def stop_job(folder):
     state = read_json(folder / 'run.json')
     pid = state.get('pid')
     if pid and alive(pid):
-        try:
-            if os.name == 'nt':
-                subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True, **NO_WINDOW)
-            else:
-                import signal
-                os.killpg(int(pid), signal.SIGKILL)  # job_worker runs start_new_session=True,
-                                                       # so its pid is also its process group id
-        except OSError:
-            pass
+        _kill_tree(pid)
+    # Also targeted directly (not just via pid's tree-kill above): if job_worker.py's own
+    # process already died on its own before this Stop click, its tree-kill target is gone,
+    # but the builder it spawned may still be alive - see _reap_orphan()'s docstring.
+    builder_pid = state.get('builder_pid')
+    if builder_pid and alive(builder_pid):
+        _kill_tree(builder_pid)
     state.update(status='failed', error='Stopped by user')
     write_json(folder / 'run.json', state)
 

@@ -53,6 +53,28 @@ class JobTests(unittest.TestCase):
             self.assertEqual(state.get('exit_code'),7)
             self.assertIn('visible failure',(run/'run.log').read_text())
 
+    def test_reaps_orphaned_builder_when_job_worker_pid_is_dead(self):
+        # Simulates the exact failure this guards against: job_worker.py's own process is
+        # killed (or crashes) while its builder subprocess (recorded as 'builder_pid') is
+        # still alive - inspect_run must kill that orphan and reclassify the run as failed,
+        # rather than leaving it running unnoticed where a retry could race it over shared caches.
+        with tempfile.TemporaryDirectory() as t:
+            folder = Path(t)
+            orphan = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+            try:
+                jobs.write_json(folder/'run.json', {'status': 'running', 'pid': 99999999,
+                                                     'builder_pid': orphan.pid, 'result': str(folder/'result')})
+                info = jobs.inspect_run(folder)
+                self.assertEqual(info['display_status'], 'Failed — see log')
+                deadline = time.monotonic()+5
+                while orphan.poll() is None and time.monotonic() < deadline:
+                    time.sleep(.1)
+                self.assertIsNotNone(orphan.poll(), 'orphaned builder process was not killed')
+            finally:
+                if orphan.poll() is None:
+                    orphan.kill()
+                orphan.wait()
+
     def test_run_folders_are_named_from_the_title_with_a_common_layout(self):
         with tempfile.TemporaryDirectory() as t:
             root=Path(t)
