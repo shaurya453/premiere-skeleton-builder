@@ -7,6 +7,7 @@ import math
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -143,6 +144,7 @@ def download_source(video_id, cache, ranges, handles=600, full=None, full_limit=
         "format": "bv*[width<=1920][height<=1920][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*[width<=1920][height<=1920]+ba/b",
         "merge_output_format": "mp4", "outtmpl": str(cache / f"{video_id}.%(ext)s"),
         "socket_timeout": 30, "retries": 2, "fragment_retries": 2,
+        "concurrent_fragment_downloads": 4,
         "js_runtimes": {"node": {"path": node}} if node else {},
         "ffmpeg_location": ffmpeg_exe(),
     }
@@ -212,15 +214,35 @@ def prepare_sources(cues, output, handles=600, full=None, cache=None, full_limit
                 ref["video_error"] = str(error)
                 cue["review"].append(str(error))
                 failures.append(str(error))
+    def fetch(identifier, refs):
+        kind, url = sources[identifier]
+        if kind in ("file", "drive"):
+            return download_direct_video(kind, identifier, url, cache)
+        return download_source(identifier, cache,
+            [(ref["source_start"], ref["source_end"]) for _, ref in refs], handles, full, full_limit, url=url)
+
+    # Downloads run concurrently across distinct videos (network-bound - threads overlap the
+    # wait on one video's connection with another's instead of doing it back-to-back); the
+    # ffmpeg trim/validate pass below stays sequential per identifier, in original cue order, so
+    # the resulting cue/ref mutations and "prepared"/"failures" ordering are unaffected by
+    # whichever download happens to finish first.
+    downloads = {}
+    with ThreadPoolExecutor(max_workers=min(3, len(groups)) or 1) as executor:
+        futures = {executor.submit(fetch, identifier, refs): identifier for identifier, refs in groups.items()}
+        for future in as_completed(futures):
+            identifier = futures[future]
+            try:
+                downloads[identifier] = future.result()
+            except Exception as error:
+                downloads[identifier] = error
+
     prepared = []
     for identifier, refs in groups.items():
         try:
-            kind, url = sources[identifier]
-            if kind in ("file", "drive"):
-                original, data = download_direct_video(kind, identifier, url, cache)
-            else:
-                original, data = download_source(identifier, cache,
-                    [(ref["source_start"], ref["source_end"]) for _, ref in refs], handles, full, full_limit, url=url)
+            outcome = downloads[identifier]
+            if isinstance(outcome, Exception):
+                raise outcome
+            original, data = outcome
             for cue, ref in refs:
                 if ref["source_start"] >= data["duration"]:
                     raise ValueError(f"Requested start {ref['source_start']:g}s is beyond the end of the video")
