@@ -145,9 +145,13 @@ def download_source(video_id, cache, ranges, handles=600, full=None, full_limit=
         "merge_output_format": "mp4", "outtmpl": str(cache / f"{video_id}.%(ext)s"),
         "socket_timeout": 30, "retries": 2, "fragment_retries": 2,
         "concurrent_fragment_downloads": 4,
-        "js_runtimes": {"node": {"path": node}} if node else {},
         "ffmpeg_location": ffmpeg_exe(),
     }
+    if node:
+        # yt-dlp's js_runtimes option takes a "runtime[:path]" string (e.g. "node:/path/to/node"),
+        # not a dict - a dict is silently ignored, which is why every download was printing
+        # "No supported JavaScript runtime could be found" despite node being bundled/available.
+        options["js_runtimes"] = f"node:{node}"
     url = url or f"https://www.youtube.com/watch?v={video_id}"
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=False)
