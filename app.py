@@ -6,6 +6,7 @@ import glob
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -38,6 +39,7 @@ UI_FONT = "Segoe UI" if os.name == "nt" else ("Helvetica Neue" if sys.platform =
 AUDIO_EXT = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".mp4", ".mov"}
 
 BG, PANEL, FIELD, FG, MUTED, ACCENT, BORDER = "#16181d", "#1e2128", "#262a33", "#e6e8ec", "#9aa1ad", "#4c8dff", "#333846"
+WARN_FG = "#e2a03f"
 
 
 def apply_dark_theme(window):
@@ -316,16 +318,51 @@ def main(smoke_test: bool = False):
     ttk.Checkbutton(options_group, text="Download linked videos (YouTube, other sites, direct files, Drive) and keep extra handles",
                     variable=settings_vars["videos"]).grid(row=0, column=0, columnspan=6, sticky="w")
 
-    def labelled(row, col, text, var, width, unit=""):
+    def labelled(row, col, text, var, width, unit="", bounds=None):
         ttk.Label(options_group, text=text).grid(row=row, column=col, sticky="w", pady=6, padx=(0, 6))
-        ttk.Entry(options_group, textvariable=var, width=width).grid(row=row, column=col + 1, sticky="w")
-        if unit:
-            ttk.Label(options_group, text=unit, foreground=MUTED).grid(row=row, column=col + 2, sticky="w", padx=(4, 18))
+        entry = ttk.Entry(options_group, textvariable=var, width=width)
+        entry.grid(row=row, column=col + 1, sticky="w")
+        hint = ttk.Label(options_group, text=unit, foreground=MUTED)
+        if unit or bounds:
+            hint.grid(row=row, column=col + 2, sticky="w", padx=(4, 18))
+        if bounds:
+            # Validated on FocusOut, not just at Build time - typing garbage here previously
+            # sat silent (auto-saved as-is) until the next Build click produced a generic
+            # ValueError with no indication of which field was wrong.
+            lo, hi = bounds
+            def validate(_=None):
+                try:
+                    value = float(var.get())
+                    if not (lo <= value <= hi):
+                        raise ValueError
+                    hint.configure(text=unit, foreground=MUTED)
+                except ValueError:
+                    hint.configure(text=f"needs {lo:g}–{hi:g}", foreground=WARN_FG)
+            entry.bind("<FocusOut>", validate)
+        return entry
 
-    labelled(1, 0, "Download whole videos up to", settings_vars["limit_minutes"], 6, "min")
-    labelled(1, 3, "Handles per side", settings_vars["buffer_minutes"], 6, "min")
-    labelled(2, 0, "Resolution", settings_vars["width"], 6, "×")
-    ttk.Entry(options_group, textvariable=settings_vars["height"], width=6).grid(row=2, column=3, sticky="w")
+    labelled(1, 0, "Download whole videos up to", settings_vars["limit_minutes"], 6, "min", bounds=(1, 1440))
+    labelled(1, 3, "Handles per side", settings_vars["buffer_minutes"], 6, "min", bounds=(0, 60))
+    width_entry = labelled(2, 0, "Resolution", settings_vars["width"], 6, "×")
+    height_entry = ttk.Entry(options_group, textvariable=settings_vars["height"], width=6)
+    height_entry.grid(row=2, column=3, sticky="w")
+    resolution_hint = ttk.Label(options_group, text="", foreground=MUTED)
+    resolution_hint.grid(row=2, column=4, sticky="w", padx=(4, 18))
+
+    def validate_resolution(_=None):
+        # Matches finish_launch()'s actual check below (positive numbers only, no upper cap) -
+        # showing a stricter range here would tell the user something is wrong that Build would
+        # actually accept.
+        try:
+            width, height = float(settings_vars["width"].get()), float(settings_vars["height"].get())
+            if width <= 0 or height <= 0:
+                raise ValueError
+            resolution_hint.configure(text="", foreground=MUTED)
+        except ValueError:
+            resolution_hint.configure(text="width/height must be positive numbers", foreground=WARN_FG)
+
+    width_entry.bind("<FocusOut>", validate_resolution)
+    height_entry.bind("<FocusOut>", validate_resolution)
     ttk.Label(options_group, text="Speech model").grid(row=3, column=0, sticky="w", pady=6)
     ttk.Combobox(options_group, textvariable=settings_vars["whisper_model"], values=WHISPER_MODELS, width=18).grid(row=3, column=1, sticky="w")
     ttk.Label(options_group, text="Runs on").grid(row=3, column=3, sticky="w", padx=(0, 6))
@@ -697,13 +734,37 @@ def main(smoke_test: bool = False):
         # without touching whatever the Build tab currently has typed in.
         resolve_script_async(source=source, quiet=False, then=after_resolve, update_var=False)
 
+    def delete_run():
+        run = chosen_run()
+        if not run:
+            return
+        if run["display_status"] in ("Running", "Starting"):
+            messagebox.showwarning("Cannot delete", "Stop the build first before deleting its folder.")
+            return
+        folder = Path(run["folder"])
+        if not messagebox.askyesno("Delete run?",
+                f'Permanently delete "{folder.name}" and everything inside it '
+                '(downloaded media, transcripts, output)? This cannot be undone.'):
+            return
+        try:
+            shutil.rmtree(folder)
+        except OSError as error:
+            messagebox.showerror("Could not delete", str(error))
+            return
+        known.pop(str(folder), None)
+        if selected[0] == str(folder):
+            selected[0], last_log[0] = "", None
+        refresh()
+
     button_row = ttk.Frame(result_group)
     button_row.pack(fill="x")
     premiere_btn = ttk.Button(button_row, text="📋  Copy Skeleton Path & Open Premiere", command=run_premiere, padding=(10, 5))
     premiere_btn.pack(side="left", padx=(0, 8))
     ttk.Button(button_row, text="Open project folder", command=open_project, padding=(10, 5)).pack(side="left", padx=(0, 8))
     retry_btn = ttk.Button(button_row, text="⟳  Retry script & audio fetch", command=retry_run, padding=(10, 5))
-    retry_btn.pack(side="left")
+    retry_btn.pack(side="left", padx=(0, 8))
+    delete_btn = ttk.Button(button_row, text="🗑  Delete run", command=delete_run, padding=(10, 5))
+    delete_btn.pack(side="left")
 
     # ---------------- Update tab ----------------
     version_group = ttk.LabelFrame(update_tab, text=" Version ", padding=12)
@@ -718,13 +779,23 @@ def main(smoke_test: bool = False):
     update_status_var = tk.StringVar(value="Checking for updates…" if FROZEN else
                                       "Updates are only available in the packaged app.")
     ttk.Label(update_group, textvariable=update_status_var, foreground=MUTED).pack(anchor="w", pady=(0, 8))
-    update_btn = ttk.Button(update_group, text="⬆  Update Now", state="disabled")
-    update_btn.pack(anchor="w")
+    update_buttons_row = ttk.Frame(update_group)
+    update_buttons_row.pack(anchor="w")
+    update_btn = ttk.Button(update_buttons_row, text="⬆  Update Now", state="disabled")
+    update_btn.pack(side="left")
+    cancel_update_btn = ttk.Button(update_buttons_row, text="Cancel", state="disabled")
+    cancel_update_btn.pack(side="left", padx=(8, 0))
     update_progress_var = tk.StringVar(value="")
     ttk.Label(update_group, textvariable=update_progress_var, foreground=MUTED).pack(anchor="w", pady=(6, 0))
 
     update_info = [{}]
     updating = [False]
+    cancel_requested = [False]
+    # True while update_progress_var is showing a result (failed/cancelled) that must survive
+    # until the user acts again, rather than being blanked by the very next poll() tick's call
+    # to update_button_state() a moment later - previously a failure message could disappear
+    # under 2 seconds after appearing, before anyone had a chance to read it.
+    sticky_message = [False]
 
     def blocking_reason():
         """Why Update Now should stay disabled right now, or None if it's clear to update -
@@ -744,16 +815,19 @@ def main(smoke_test: bool = False):
         button reacts immediately to a build starting/finishing elsewhere in the app."""
         if not FROZEN:
             update_btn.configure(state="disabled")
+            cancel_update_btn.configure(state="disabled")
             return
+        cancel_update_btn.configure(state="normal" if updating[0] else "disabled")
         reason = blocking_reason()
         info = update_info[0]
         if reason:
             update_btn.configure(state="disabled")
-            if not updating[0]:
+            if not updating[0] and not sticky_message[0]:
                 update_progress_var.set(reason)
         elif info.get("available"):
             update_btn.configure(state="normal")
-            update_progress_var.set("")
+            if not sticky_message[0]:
+                update_progress_var.set("")
         else:
             update_btn.configure(state="disabled")
 
@@ -765,6 +839,7 @@ def main(smoke_test: bool = False):
             info = updater.update_available()
             def done():
                 update_info[0] = info
+                sticky_message[0] = False
                 if info.get("error"):
                     update_status_var.set(f"Couldn't check for updates: {info['error']}")
                 elif info.get("available"):
@@ -775,6 +850,13 @@ def main(smoke_test: bool = False):
             window.after(0, done)
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def cancel_update():
+        if updating[0]:
+            cancel_requested[0] = True
+            update_progress_var.set("Cancelling…")
+
+    cancel_update_btn.configure(command=cancel_update)
 
     def do_update():
         reason = blocking_reason()
@@ -789,19 +871,31 @@ def main(smoke_test: bool = False):
                 "Your Projects, Media, Models and Cache folders are not affected.\n\nContinue?"):
             return
         updating[0] = True
+        cancel_requested[0] = False
+        sticky_message[0] = False
         update_btn.configure(state="disabled")
+        cancel_update_btn.configure(state="normal")
         update_progress_var.set("Starting update…")
 
         def worker():
             try:
                 zip_path = updater.download_update(info["asset_url"],
-                    progress=lambda m: window.after(0, lambda: update_progress_var.set(m)))
+                    progress=lambda m: window.after(0, lambda: update_progress_var.set(m)),
+                    should_cancel=lambda: cancel_requested[0])
                 window.after(0, lambda: update_progress_var.set("Restarting…"))
                 updater.launch_updater_and_exit(zip_path)
                 window.after(200, window.destroy)
+            except updater.UpdateCancelled:
+                def cancelled():
+                    updating[0] = False
+                    sticky_message[0] = True
+                    update_progress_var.set("Update cancelled.")
+                    update_button_state()
+                window.after(0, cancelled)
             except Exception as error:
                 def failed():
                     updating[0] = False
+                    sticky_message[0] = True
                     update_progress_var.set(f"Update failed: {error}")
                     update_button_state()
                 window.after(0, failed)
@@ -913,6 +1007,7 @@ def main(smoke_test: bool = False):
         retry_status = ("Failed — see log", "Interrupted / incomplete")
         can_retry = bool(r) and not running and not resolving[0] and r["display_status"] in retry_status and r.get("config")
         retry_btn.configure(state="normal" if can_retry else "disabled")
+        delete_btn.configure(state="normal" if (r and r["display_status"] not in ("Running", "Starting")) else "disabled")
         update_button_state()
         if not r:
             return
