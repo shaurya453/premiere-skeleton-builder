@@ -54,26 +54,39 @@ class JobTests(unittest.TestCase):
             self.assertIn('visible failure',(run/'run.log').read_text())
 
     def test_reaps_orphaned_builder_when_job_worker_pid_is_dead(self):
-        # Simulates the exact failure this guards against: job_worker.py's own process is
-        # killed (or crashes) while its builder subprocess (recorded as 'builder_pid') is
-        # still alive - inspect_run must kill that orphan and reclassify the run as failed,
-        # rather than leaving it running unnoticed where a retry could race it over shared caches.
+        # Simulates the exact failure this guards against - and does it with real processes,
+        # not a fabricated pid, because the fix is platform-sensitive in a way that's easy to
+        # get subtly wrong: on POSIX, the builder subprocess never gets its own process group
+        # (job_worker.py spawns it with a plain subprocess.Popen, no start_new_session), so it
+        # inherits job_worker's original group - which remains a valid killpg target by that
+        # original pid even after job_worker itself has exited, for as long as the builder is
+        # still in it. A "job_worker" launcher is spawned as its own session/group leader,
+        # itself spawns a "builder" child that outlives it, then exits - leaving a real orphan
+        # in a real, still-valid process group, exactly like the production crash scenario.
         with tempfile.TemporaryDirectory() as t:
             folder = Path(t)
-            orphan = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+            launcher_code = ("import subprocess, sys; "
+                              "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+                              "print(p.pid, flush=True)")
+            launcher = subprocess.Popen([sys.executable, '-c', launcher_code],
+                                        stdout=subprocess.PIPE, text=True, start_new_session=True)
+            builder_pid = int(launcher.stdout.readline().strip())
+            job_worker_pid = launcher.pid
+            launcher.wait(timeout=5)  # the launcher exits almost immediately; the builder outlives it
+            launcher.stdout.close()
             try:
-                jobs.write_json(folder/'run.json', {'status': 'running', 'pid': 99999999,
-                                                     'builder_pid': orphan.pid, 'result': str(folder/'result')})
+                self.assertFalse(jobs.alive(job_worker_pid))
+                self.assertTrue(jobs.alive(builder_pid))
+                jobs.write_json(folder/'run.json', {'status': 'running', 'pid': job_worker_pid,
+                                                     'builder_pid': builder_pid, 'result': str(folder/'result')})
                 info = jobs.inspect_run(folder)
                 self.assertEqual(info['display_status'], 'Failed — see log')
                 deadline = time.monotonic()+5
-                while orphan.poll() is None and time.monotonic() < deadline:
+                while jobs.alive(builder_pid) and time.monotonic() < deadline:
                     time.sleep(.1)
-                self.assertIsNotNone(orphan.poll(), 'orphaned builder process was not killed')
+                self.assertFalse(jobs.alive(builder_pid), 'orphaned builder process was not killed')
             finally:
-                if orphan.poll() is None:
-                    orphan.kill()
-                orphan.wait()
+                jobs._kill_orphaned_builder({'pid': job_worker_pid, 'builder_pid': builder_pid})
 
     def test_run_folders_are_named_from_the_title_with_a_common_layout(self):
         with tempfile.TemporaryDirectory() as t:

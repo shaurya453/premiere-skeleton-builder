@@ -53,12 +53,11 @@ def alive(pid):
 
 
 def _kill_tree(pid):
-    """Best-effort kill of pid and its descendants. On POSIX, pid doubles as the process
-    group id (job_worker.py always starts with start_new_session=True), so killing the group
-    reaches children/grandchildren (skeleton_builder.py, its ffmpeg calls) regardless of
-    whether pid itself is still alive - unlike Windows' `taskkill /T`, which needs pid itself
-    to still exist to walk its tree, which is why job_worker.py separately records its direct
-    child's own pid (state['builder_pid']) for _reap_orphan() to target below."""
+    """Best-effort kill of pid and its descendants, for use while pid itself is still alive.
+    On POSIX, pid doubles as the process group id (job_worker.py always starts with
+    start_new_session=True), so killing the group reaches children/grandchildren
+    (skeleton_builder.py, its ffmpeg calls). On Windows, `taskkill /T` walks the tree from
+    pid - which needs pid to still be alive to find its children at all."""
     try:
         if os.name == 'nt':
             subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True, **NO_WINDOW)
@@ -66,6 +65,26 @@ def _kill_tree(pid):
             import signal
             os.killpg(int(pid), signal.SIGKILL)
     except OSError:
+        pass
+
+
+def _kill_orphaned_builder(state):
+    """Used only once job_worker.py's own pid is already dead, so there's no longer a live pid
+    to tree-kill from. On POSIX, killpg still works via job_worker's *original* pid (state['pid'])
+    - a process group id persists as a valid killpg target for as long as any member (here, the
+    builder subprocess, which inherits it rather than getting its own) is still alive, even after
+    the group's leader has exited - so state['builder_pid'] itself is not a usable POSIX target.
+    On Windows, `taskkill /T` needs a currently-alive pid to walk from, and job_worker's own no
+    longer qualifies, so this targets state['builder_pid'] (still alive) directly instead."""
+    try:
+        if os.name == 'nt':
+            builder_pid = state.get('builder_pid')
+            if builder_pid:
+                subprocess.run(['taskkill', '/PID', str(builder_pid), '/T', '/F'], capture_output=True, **NO_WINDOW)
+        else:
+            import signal
+            os.killpg(int(state['pid']), signal.SIGKILL)
+    except (OSError, KeyError, ValueError):
         pass
 
 
@@ -84,7 +103,7 @@ def _reap_orphan(folder, state):
         # No live orphan actually found - leave status alone so the existing stale-pid/
         # "Interrupted / incomplete" classification below still applies unchanged.
         return state
-    _kill_tree(builder_pid)
+    _kill_orphaned_builder(state)
     state = {**state, 'status': 'failed', 'error': 'Build process was interrupted unexpectedly (orphaned process stopped)'}
     write_json(Path(folder)/'run.json', state)
     return state
@@ -228,12 +247,14 @@ def stop_job(folder):
     pid = state.get('pid')
     if pid and alive(pid):
         _kill_tree(pid)
-    # Also targeted directly (not just via pid's tree-kill above): if job_worker.py's own
-    # process already died on its own before this Stop click, its tree-kill target is gone,
-    # but the builder it spawned may still be alive - see _reap_orphan()'s docstring.
-    builder_pid = state.get('builder_pid')
-    if builder_pid and alive(builder_pid):
-        _kill_tree(builder_pid)
+    else:
+        # job_worker.py's own process already died on its own before this Stop click, so the
+        # tree-kill above has no live pid to work from - but the builder it spawned may still
+        # be alive; see _kill_orphaned_builder()'s docstring for why this needs different
+        # targets per platform rather than just reusing builder_pid directly everywhere.
+        builder_pid = state.get('builder_pid')
+        if builder_pid and alive(builder_pid):
+            _kill_orphaned_builder(state)
     state.update(status='failed', error='Stopped by user')
     write_json(folder / 'run.json', state)
 
