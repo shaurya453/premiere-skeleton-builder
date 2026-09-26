@@ -69,6 +69,13 @@ def latest_release(timeout=15):
         with urllib.request.urlopen(request, timeout=timeout) as response:
             data = json.loads(response.read())
     except urllib.error.HTTPError as error:
+        # GitHub's unauthenticated API rate limit (60 req/hr/IP) returns 403 with these headers -
+        # distinguish it from a generic 403 so a rate-limited user sees an actionable wait time
+        # instead of an opaque error repeated on every future poll.
+        if error.code == 403 and error.headers.get("X-RateLimit-Remaining") == "0":
+            reset = error.headers.get("X-RateLimit-Reset")
+            wait = f" Try again after {time.strftime('%H:%M', time.localtime(int(reset)))}." if reset else ""
+            raise ValueError(f"GitHub API rate limit reached checking for updates.{wait}") from error
         raise ValueError(f"GitHub returned HTTP {error.code} checking for updates") from error
     except urllib.error.URLError as error:
         raise ValueError(f"Network error checking for updates: {error.reason}") from error
@@ -96,26 +103,39 @@ def update_available():
             "available": current != "unknown" and info["commit"] != current}
 
 
-def download_update(asset_url, progress=lambda m: None):
-    """Download the new build's zip to a temp file; returns its path."""
+class UpdateCancelled(Exception):
+    """Raised by download_update when should_cancel() returns True mid-download."""
+
+
+def download_update(asset_url, progress=lambda m: None, should_cancel=lambda: False):
+    """Download the new build's zip to a temp file; returns its path.
+
+    should_cancel is polled between chunks (not just before starting) so a user-initiated
+    cancel on a large/slow download takes effect promptly instead of only at the next call."""
     dest_dir = Path(cache_dir()) / "update_download"
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / "update.zip"
     request = urllib.request.Request(asset_url, headers=_USER_AGENT)
     progress("Downloading update...")
-    with urllib.request.urlopen(request, timeout=180) as response, dest.open("wb") as out:
-        total = int(response.headers.get("Content-Length") or 0)
-        done, next_report = 0, 5 * 1024 * 1024
-        while True:
-            chunk = response.read(1 << 20)
-            if not chunk:
-                break
-            out.write(chunk)
-            done += len(chunk)
-            if done >= next_report:
-                progress(f"Downloading update: {done / 1024**2:.0f}"
-                          + (f" / {total / 1024**2:.0f}" if total else "") + " MB")
-                next_report = done + 5 * 1024 * 1024
+    try:
+        with urllib.request.urlopen(request, timeout=180) as response, dest.open("wb") as out:
+            total = int(response.headers.get("Content-Length") or 0)
+            done, next_report = 0, 5 * 1024 * 1024
+            while True:
+                if should_cancel():
+                    raise UpdateCancelled("Update cancelled")
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if done >= next_report:
+                    progress(f"Downloading update: {done / 1024**2:.0f}"
+                              + (f" / {total / 1024**2:.0f}" if total else "") + " MB")
+                    next_report = done + 5 * 1024 * 1024
+    except UpdateCancelled:
+        dest.unlink(missing_ok=True)
+        raise
     return dest
 
 

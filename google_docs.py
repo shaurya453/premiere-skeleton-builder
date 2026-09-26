@@ -9,6 +9,8 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+from network_retry import with_retries
+
 DOC_ID_REGEX = re.compile(r"(?:/document/(?:u/\d+/)?d/|^)([a-zA-Z0-9_-]{25,})")
 # A Google Doc with multiple tabs puts the open tab's id in the URL, e.g. "?tab=t.0" or
 # "?tab=t.abc123xyz". Google's docx export endpoint honors this same param to restrict the
@@ -120,47 +122,54 @@ def download_google_doc(
 
     req = urllib.request.Request(export_url, headers=headers)
     progress("Contacting Google Docs — this can take a while for docs with large images…")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            final_url = resp.geturl()
-            # If redirected to Google login, document is private
-            if "accounts.google.com" in final_url:
+
+    def _fetch():
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                final_url = resp.geturl()
+                # If redirected to Google login, document is private
+                if "accounts.google.com" in final_url:
+                    raise PermissionError(
+                        f"Google Doc {doc_id} is private.\n\n"
+                        "Please set sharing permissions in Google Docs to:\n"
+                        "'Anyone with the link can view' (Viewer access),\n"
+                        "or download the .docx file manually via File > Download > Microsoft Word (.docx)."
+                    )
+
+                resp_headers = resp.headers
+                total = int(resp_headers.get("Content-Length") or 0)
+                chunks, done, next_report = [], 0, 5 * 1024 * 1024
+                while True:
+                    chunk = resp.read(1 << 20)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    done += len(chunk)
+                    if done >= next_report:
+                        progress(f"Downloading script from Google Docs: {done / 1024**2:.0f}"
+                                 + (f" / {total / 1024**2:.0f}" if total else "") + " MB")
+                        next_report = done + 5 * 1024 * 1024
+                data = b"".join(chunks)
+            return data, resp_headers
+
+        except urllib.error.HTTPError as err:
+            if err.code in (401, 403):
                 raise PermissionError(
-                    f"Google Doc {doc_id} is private.\n\n"
-                    "Please set sharing permissions in Google Docs to:\n"
-                    "'Anyone with the link can view' (Viewer access),\n"
-                    "or download the .docx file manually via File > Download > Microsoft Word (.docx)."
-                )
+                    f"Access denied to Google Doc (HTTP {err.code}).\n"
+                    "Please verify the document is shared as 'Anyone with the link can view'."
+                ) from err
+            if err.code == 404:
+                raise FileNotFoundError(
+                    f"Google Doc not found (HTTP 404).\n"
+                    f"Please verify the URL or ID: {doc_id}"
+                ) from err
+            raise RuntimeError(f"Failed to fetch Google Doc (HTTP {err.code}): {err.reason}") from err
+        except urllib.error.URLError as err:
+            raise ConnectionError(f"Network error while connecting to Google Docs: {err.reason}") from err
 
-            resp_headers = resp.headers
-            total = int(resp_headers.get("Content-Length") or 0)
-            chunks, done, next_report = [], 0, 5 * 1024 * 1024
-            while True:
-                chunk = resp.read(1 << 20)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                done += len(chunk)
-                if done >= next_report:
-                    progress(f"Downloading script from Google Docs: {done / 1024**2:.0f}"
-                             + (f" / {total / 1024**2:.0f}" if total else "") + " MB")
-                    next_report = done + 5 * 1024 * 1024
-            data = b"".join(chunks)
-
-    except urllib.error.HTTPError as err:
-        if err.code in (401, 403):
-            raise PermissionError(
-                f"Access denied to Google Doc (HTTP {err.code}).\n"
-                "Please verify the document is shared as 'Anyone with the link can view'."
-            ) from err
-        if err.code == 404:
-            raise FileNotFoundError(
-                f"Google Doc not found (HTTP 404).\n"
-                f"Please verify the URL or ID: {doc_id}"
-            ) from err
-        raise RuntimeError(f"Failed to fetch Google Doc (HTTP {err.code}): {err.reason}") from err
-    except urllib.error.URLError as err:
-        raise ConnectionError(f"Network error while connecting to Google Docs: {err.reason}") from err
+    # Retried only on ConnectionError (a dropped connection) - PermissionError/FileNotFoundError/
+    # RuntimeError above are non-retryable outcomes (bad sharing settings, wrong ID, etc.).
+    data, resp_headers = with_retries(_fetch)
 
     # Validate that we got a valid DOCX (which is a ZIP package starting with PK\x03\x04)
     if not data.startswith(b"PK\x03\x04"):

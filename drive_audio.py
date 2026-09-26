@@ -7,6 +7,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+from network_retry import with_retries
+
 DRIVE_ID = re.compile(r"(?:/file/(?:u/\d+/)?d/|[?&]id=)([A-Za-z0-9_-]{20,})")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 AUDIO_TYPES = (".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".mp4", ".mov", ".mkv", ".webm")
@@ -48,37 +50,51 @@ def download_drive_file(url: str, destination_dir: str | Path, label: str = "fil
         raise ValueError("Could not find a file ID in that Google Drive link.")
     endpoint = "https://drive.usercontent.google.com/download?" + urllib.parse.urlencode(
         {"id": file_id, "export": "download", "confirm": "t"})
-    request = urllib.request.Request(endpoint, headers={"User-Agent": USER_AGENT})
     destination_dir = Path(destination_dir)
     destination_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        response = urllib.request.urlopen(request, timeout=timeout)
-    except urllib.error.HTTPError as err:
-        if err.code in (401, 403, 404):
-            raise PermissionError("Google Drive refused access. Share the file as 'Anyone with the link can view'.") from err
-        raise RuntimeError(f"Google Drive download failed (HTTP {err.code}).") from err
-    except urllib.error.URLError as err:
-        raise ConnectionError(f"Network error while contacting Google Drive: {err.reason}") from err
-    with response:
-        kind = response.headers.get("Content-Type", "")
-        if "text/html" in kind:
-            raise PermissionError("Google Drive returned a web page instead of the file. "
-                                  "Share it as 'Anyone with the link can view' and check the link.")
-        name = _header_filename(response.headers, f"drive_{file_id[:10]}{default_ext}")
-        target = destination_dir / _safe_name(name, f"drive_{file_id[:10]}{default_ext}")
-        total = int(response.headers.get("Content-Length") or 0)
-        done, next_report = 0, 0
-        with target.open("wb") as out:
-            while True:
-                chunk = response.read(1 << 20)
-                if not chunk:
-                    break
-                out.write(chunk)
-                done += len(chunk)
-                if done >= next_report:
-                    progress(f"Downloading {label} from Drive: {done / 1024**2:.0f}"
-                             + (f" / {total / 1024**2:.0f}" if total else "") + " MB")
-                    next_report = done + 10 * 1024**2
+
+    def _fetch():
+        request = urllib.request.Request(endpoint, headers={"User-Agent": USER_AGENT})
+        try:
+            response = urllib.request.urlopen(request, timeout=timeout)
+        except urllib.error.HTTPError as err:
+            if err.code in (401, 403, 404):
+                raise PermissionError("Google Drive refused access. Share the file as 'Anyone with the link can view'.") from err
+            raise RuntimeError(f"Google Drive download failed (HTTP {err.code}).") from err
+        except urllib.error.URLError as err:
+            raise ConnectionError(f"Network error while contacting Google Drive: {err.reason}") from err
+        with response:
+            kind = response.headers.get("Content-Type", "")
+            if "text/html" in kind:
+                raise PermissionError("Google Drive returned a web page instead of the file. "
+                                      "Share it as 'Anyone with the link can view' and check the link.")
+            name = _header_filename(response.headers, f"drive_{file_id[:10]}{default_ext}")
+            target = destination_dir / _safe_name(name, f"drive_{file_id[:10]}{default_ext}")
+            # Written to a temp path first: a connection drop mid-download must not leave a
+            # truncated file at the final name, which a later run could otherwise mistake for
+            # a complete, valid download.
+            partial = target.with_name(target.name + ".part")
+            total = int(response.headers.get("Content-Length") or 0)
+            done, next_report = 0, 0
+            try:
+                with partial.open("wb") as out:
+                    while True:
+                        chunk = response.read(1 << 20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        done += len(chunk)
+                        if done >= next_report:
+                            progress(f"Downloading {label} from Drive: {done / 1024**2:.0f}"
+                                     + (f" / {total / 1024**2:.0f}" if total else "") + " MB")
+                            next_report = done + 10 * 1024**2
+            except (urllib.error.URLError, OSError) as err:
+                partial.unlink(missing_ok=True)
+                raise ConnectionError(f"Network error while downloading from Drive: {err}") from err
+            partial.replace(target)
+        return target
+
+    target = with_retries(_fetch)
     if target.stat().st_size == 0:
         target.unlink(missing_ok=True)
         raise ValueError("Google Drive returned an empty file.")

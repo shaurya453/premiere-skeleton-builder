@@ -14,6 +14,7 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 from drive_audio import download_drive_file, is_drive_url
+from network_retry import with_retries
 
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".avif"}
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
@@ -166,15 +167,25 @@ def download_direct_video(kind: str, key: str, url: str, cache: Path,
             saved.replace(found)
         else:
             found = cache / (key + _suffix(url))
+            # Written to a temp path and only renamed onto `found` once the download completes
+            # in full - a mid-download interruption (network drop, process kill) must not leave
+            # a truncated file at the path the "already cached" check above looks for, or every
+            # future run would find it, trust it, and fail identically forever.
+            partial = found.with_name(found.name + ".part")
             progress(f"Downloading video file: {url}")
-            request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-            try:
-                with urllib.request.urlopen(request, timeout=60) as response, found.open("wb") as out:
-                    while chunk := response.read(1 << 20):
-                        out.write(chunk)
-            except (urllib.error.URLError, OSError) as error:
-                found.unlink(missing_ok=True)
-                raise RuntimeError(f"could not download {url}: {error}") from error
+
+            def _fetch():
+                request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+                try:
+                    with urllib.request.urlopen(request, timeout=60) as response, partial.open("wb") as out:
+                        while chunk := response.read(1 << 20):
+                            out.write(chunk)
+                    partial.replace(found)
+                except (urllib.error.URLError, OSError) as error:
+                    partial.unlink(missing_ok=True)
+                    raise ConnectionError(f"could not download {url}: {error}") from error
+
+            with_retries(_fetch)
     info = probe(found)
     title = Path(urllib.parse.unquote(urllib.parse.urlparse(url).path)).stem or key
     return found, {"id": key, "title": title, "duration": info["duration"], "source_url": url,
