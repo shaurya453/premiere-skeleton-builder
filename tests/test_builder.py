@@ -366,6 +366,32 @@ class BookmarkTests(unittest.TestCase):
             self.assertFalse(any("_1a2b3c4d5e6f" in w for w in warnings))
             self.assertTrue(any("realUserBookmark9" in w and "never attached" in w for w in warnings))
 
+    def test_isolated_video_timestamp_paragraph_becomes_an_insert_cue(self):
+        # A scriptwriter habit seen in a real script: a bracketed timestamp alone on its own
+        # paragraph, hyperlinked to the source video, with no other narration in that
+        # paragraph at all - meaning "the VO pauses here for this clip," not "illustrate this
+        # passage." This used to be silently dropped with a "No preceding narration" warning.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            doc = '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>
+                     <w:p><w:r><w:t>Officers arrived and searched the house.</w:t></w:r></w:p>
+                     <w:p><w:hyperlink r:id="h1"><w:r><w:t>[ 2:07 - 2:10 ]</w:t></w:r></w:hyperlink></w:p>
+                     <w:p><w:r><w:t>What they found upstairs changed everything.</w:t></w:r></w:p>
+                     </w:body></w:document>'''
+            rels = '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="h1" Target="https://youtu.be/fftGair1ZoA"/></Relationships>'''
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+            words, cues, assets, warnings = read_docx(root / "script.docx", root / "assets")
+            self.assertFalse(any("No preceding narration" in w for w in warnings))
+            inserts = [c for c in cues if c.get("insert")]
+            self.assertEqual(len(inserts), 1)
+            self.assertEqual(inserts[0]["kind"], "video")
+            self.assertEqual(inserts[0]["script_start"], inserts[0]["script_end"])
+            self.assertEqual(inserts[0]["refs"][0]["target"], "https://youtu.be/fftGair1ZoA")
+
     def test_wrong_audio_cache_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -409,6 +435,27 @@ class AlignmentDiagnosticsTests(unittest.TestCase):
         script_tokens = [f"word{i}" for i in range(40)]
         narration = [{"token": t, "start": i, "end": i + 1} for i, t in enumerate(script_tokens)]
         align_cues(script_tokens, [], narration)  # should not raise
+
+
+class InsertCueAlignmentTests(unittest.TestCase):
+    def test_insert_cue_gets_splice_time_from_nearest_earlier_word(self):
+        # An insert's script_start == script_end (no matched passage - see read_docx) would
+        # crash the normal range-matching path on an empty `matches` list; it needs its own
+        # splice-time computation instead: the end of the nearest earlier aligned word.
+        script_tokens = [f"word{i}" for i in range(10)]
+        narration = [{"token": t, "start": i * 2.0, "end": i * 2.0 + 1.0} for i, t in enumerate(script_tokens)]
+        cue = {"kind": "video", "script_start": 5, "script_end": 5, "insert": True, "refs": []}
+        align_cues(script_tokens, [cue], narration)
+        self.assertEqual(cue["start"], cue["end"])
+        self.assertEqual(cue["start"], narration[4]["end"])
+
+    def test_insert_cue_with_nothing_before_it_falls_back_to_unaligned(self):
+        script_tokens = [f"word{i}" for i in range(10)]
+        narration = [{"token": t, "start": i * 2.0, "end": i * 2.0 + 1.0} for i, t in enumerate(script_tokens)]
+        cue = {"kind": "video", "script_start": 0, "script_end": 0, "insert": True, "refs": []}
+        align_cues(script_tokens, [cue], narration)
+        self.assertIsNone(cue["start"])
+        self.assertIsNone(cue["end"])
 
 
 class UnconfirmedTrackTests(unittest.TestCase):
@@ -522,6 +569,53 @@ class XmlTests(unittest.TestCase):
             # both: 2 tracks for the confirmed clip's source audio, 2 more for the
             # unconfirmed one's (no voiceover track here, since audio_path is None).
             self.assertEqual(len(tracks), 4)
+
+    def test_hard_insert_splits_the_voiceover_track_around_the_gap(self):
+        # A hard-insert clip (see build()) needs the voiceover audio itself to have a real
+        # gap at its position - not just another overlay sitting on top of continuous
+        # narration - and the sequence's own duration must grow to fit the gap, or every
+        # clip already shifted later by build() would get wrongly capped/dropped.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            video_path = root / "video.mp4"
+            video_path.write_bytes(b"fake")
+            audio_path = root / "voice.wav"
+            audio_path.write_bytes(b"fake")
+            insert_clip = {"name": "INSERT clip", "start_frame": 300, "end_frame": 390,
+                           "path": str(video_path), "width": 640, "height": 360, "kind": "video",
+                           "has_audio": True, "source_duration_frames": 900, "in_frame": 0}
+            path = root / "output.xml"
+            xml_sequence(path, "Test", [insert_clip], [], [], audio_path, 20, 1920, 1080,
+                         audio_inserts=[(300, 90)])
+            validate_xml(path)  # must not raise "Invalid clip range"
+            xml = ET.parse(str(path))
+            self.assertEqual(int(xml.findtext(".//sequence/duration")), 600 + 90)
+            vo_clips = xml.findall(".//sequence/media/audio/track[1]/clipitem")
+            self.assertEqual(len(vo_clips), 2)
+            self.assertEqual([c.findtext("start") for c in vo_clips], ["0", "390"])
+            self.assertEqual([c.findtext("end") for c in vo_clips], ["300", "690"])
+            self.assertEqual([c.findtext("in") for c in vo_clips], ["0", "300"])
+            self.assertEqual([c.findtext("out") for c in vo_clips], ["300", "600"])
+            # The insert clip's own audio (has_audio) still gets its own stereo pair, same as
+            # any other video clip - the VO pausing doesn't mean the clip itself is silent.
+            tracks = xml.findall(".//sequence/media/audio/track")
+            self.assertEqual(len(tracks), 3)
+
+    def test_no_inserts_keeps_the_single_continuous_voiceover_clip(self):
+        # Zero-insert scripts (the overwhelming common case) must produce byte-identical
+        # voiceover output to before this feature existed - same clip/file ids, one segment.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio_path = root / "voice.wav"
+            audio_path.write_bytes(b"fake")
+            path = root / "output.xml"
+            xml_sequence(path, "Test", [], [], [], audio_path, 20, 1920, 1080)
+            xml = ET.parse(str(path))
+            clip = xml.find(".//sequence/media/audio/track/clipitem")
+            self.assertEqual(clip.get("id"), "voiceover")
+            self.assertEqual(clip.findtext("name"), "Voiceover - continuous")
+            self.assertEqual(clip.findtext("start"), "0")
+            self.assertEqual(clip.findtext("end"), str(600))
 
 
 if __name__ == "__main__":

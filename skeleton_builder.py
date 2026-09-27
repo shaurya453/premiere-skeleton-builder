@@ -357,6 +357,19 @@ def read_docx(path, assets_dir, fetch_web=True):
                 start_index = (previous["script_start"] - base if previous["local_end"] == end_index
                                else max(start_index, previous["local_end"]))
             if start_index >= end_index:
+                if kind == "video":
+                    # A video link with no narration anywhere in its own paragraph - the
+                    # scriptwriter put its timestamp alone on its own line - means something
+                    # different from every other cue: not "illustrate this passage" but "the VO
+                    # pauses here; this clip needs its own moment, possibly with its own audio,
+                    # before the VO resumes." align_cues() gives this a splice time (the end of
+                    # the nearest earlier aligned word) instead of a matched passage, and build()
+                    # splices it into the timeline rather than overlaying it on continuous audio.
+                    cues.append({"kind": kind, "script_start": base, "script_end": base,
+                                 "local_end": end_index, "insert": True,
+                                 "passage": "(insert - VO pauses for this clip)",
+                                 "doc_order": paragraph["doc_order"], "refs": [ref]})
+                    continue
                 warnings.append(f"No preceding narration for {label}")
                 continue
             passage = clean[ptokens[start_index][1]:ptokens[end_index-1][2]]
@@ -505,6 +518,21 @@ def align_cues(script_tokens, cues, narration):
                           + (f"\n{detail}" if detail else ""))
     mapped = sorted(mapping)
     for cue in cues:
+        if cue.get("insert"):
+            # A splice point, not a matched passage - script_start == script_end, so the normal
+            # range-matching below (which assumes at least one word) would crash on empty
+            # `matches`. Its time is the end of the nearest earlier aligned word instead - where
+            # the VO actually pauses - falling back to today's "couldn't align" convention (lands
+            # on the unsynced track) if there's no earlier aligned word at all.
+            idx = bisect.bisect_left(mapped, cue["script_start"]) - 1
+            if idx < 0:
+                cue.update(start=None, end=None, match=0,
+                           review=["Insert has no preceding aligned narration; placed on the unsynced track instead"])
+            else:
+                t = narration[mapping[mapped[idx]]]["end"]
+                cue.update(start=round(t, 3), end=round(t, 3), match=1,
+                           review=["Inserted clip: VO paused here; verify the cut and duration"])
+            continue
         a, b = cue["script_start"], cue["script_end"]
         matches = [i for i in range(a, b) if i in mapping]
         if len(matches) < min(3, b - a):
@@ -597,8 +625,14 @@ def motion(clip, scale):
 
 
 def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, height, limit=None,
-                 source_audio_enabled=False, unconfirmed=()):
-    frames = math.ceil(duration * FPS) if limit is None else min(round(limit * FPS), math.ceil(duration * FPS))
+                 source_audio_enabled=False, unconfirmed=(), audio_inserts=()):
+    orig_frames = math.ceil(duration * FPS)
+    # A hard-insert clip (see build()) adds real time to the timeline beyond the voiceover's own
+    # natural length - every clip placed after one has already been shifted later to make room,
+    # so the safety caps below (frames) must grow to match or those shifted clips would be
+    # wrongly clipped/dropped as if they ran past the end of the sequence.
+    total_frames = orig_frames + sum(gap for _, gap in audio_inserts)
+    frames = total_frames if limit is None else min(round(limit * FPS), total_frames)
     root = ET.Element("xmeml", version="5")
     seq = sub(root, "sequence", id="sequence-1")
     sub(seq, "name", name)
@@ -675,27 +709,40 @@ def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, hei
     sub(ac, "depth", 16)
     sub(ac, "samplerate", 48000)
     if audio_path:
+        # No inserts: one continuous clip spanning the whole recording, exactly as before.
+        # With inserts: the same source audio split into contiguous segments - one per gap - each
+        # placed at its own shifted timeline position, leaving a real silent gap where the
+        # inserted clip's own footage (and audio, if it has any) takes over instead.
+        segments, cursor_source, cursor_shift = [], 0, 0
+        for splice, gap in sorted(audio_inserts):
+            segments.append((cursor_source + cursor_shift, splice + cursor_shift, cursor_source, splice))
+            cursor_source, cursor_shift = splice, cursor_shift + gap
+        segments.append((cursor_source + cursor_shift, orig_frames + cursor_shift, cursor_source, orig_frames))
         track = sub(audio, "track")
-        clip = sub(track, "clipitem", id="voiceover")
-        sub(clip, "name", "Voiceover - continuous")
-        sub(clip, "enabled", "TRUE")
-        sub(clip, "duration", math.ceil(duration*FPS))
-        rate(clip)
-        for key, value in [("start", 0), ("end", frames), ("in", 0), ("out", frames)]:
-            sub(clip, key, value)
-        f = sub(clip, "file", id="voiceover-file")
-        sub(f, "name", Path(audio_path).name)
-        sub(f, "pathurl", file_url(audio_path))
-        rate(f)
-        sub(f, "duration", math.ceil(duration*FPS))
-        am = sub(sub(f, "media"), "audio")
-        ac = sub(am, "samplecharacteristics")
-        sub(ac, "depth", 16)
-        sub(ac, "samplerate", 48000)
-        sub(am, "channelcount", 1)
-        source = sub(clip, "sourcetrack")
-        sub(source, "mediatype", "audio")
-        sub(source, "trackindex", 1)
+        for seg_index, (t_start, t_end, s_in, s_out) in enumerate(segments):
+            t_end = min(t_end, frames)
+            if t_start >= frames or t_end <= t_start:
+                continue
+            clip = sub(track, "clipitem", id="voiceover" if len(segments) == 1 else f"voiceover-{seg_index}")
+            sub(clip, "name", "Voiceover - continuous" if len(segments) == 1 else f"Voiceover part {seg_index+1}")
+            sub(clip, "enabled", "TRUE")
+            sub(clip, "duration", orig_frames)
+            rate(clip)
+            for key, value in [("start", t_start), ("end", t_end), ("in", s_in), ("out", s_in+(t_end-t_start))]:
+                sub(clip, key, value)
+            f = sub(clip, "file", id="voiceover-file" if len(segments) == 1 else f"voiceover-file-{seg_index}")
+            sub(f, "name", Path(audio_path).name)
+            sub(f, "pathurl", file_url(audio_path))
+            rate(f)
+            sub(f, "duration", orig_frames)
+            am = sub(sub(f, "media"), "audio")
+            ac = sub(am, "samplecharacteristics")
+            sub(ac, "depth", 16)
+            sub(ac, "samplerate", 48000)
+            sub(am, "channelcount", 1)
+            source = sub(clip, "sourcetrack")
+            sub(source, "mediatype", "audio")
+            sub(source, "trackindex", 1)
         sub(track, "enabled", "TRUE")
         sub(track, "locked", "FALSE")
     # Stereo source sound is linked on its own tracks so it can be muted per-clip in Premiere if
@@ -932,6 +979,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
                 cue["review"].append(f"{label} is under 1.2 seconds; consider extending")
     video_assets, video_edits, video_selects = [], [], []
     unconfirmed_video_refs = []
+    audio_inserts = []
     if download_videos:
         from youtube_media import prepare_sources, place_video_clips
         video_assets, failures = prepare_sources(cues, media_dir / "Videos", handles, full_videos, full_limit=full_video_limit)
@@ -941,6 +989,47 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
         for cue in cues:
             if cue["kind"] == "video" and cue["start"] is None:
                 unconfirmed_video_refs.extend((cue, ref) for ref in cue["refs"] if ref.get("video_asset"))
+        # Hard inserts (see read_docx/align_cues): the VO pauses, this clip's own footage (and
+        # audio, if it has any) takes over, and everything already placed after the splice point
+        # shifts later to make room - not an overlay like every other video cue. Gathered here,
+        # after ordinary placement, so it never competes with place_video_clips' narration-capped
+        # math above (which would otherwise collapse its zero-width start==end to nothing).
+        pending_inserts = []  # (original_splice_frame, gap_frames, ref, cue)
+        for cue in cues:
+            if not (cue.get("insert") and cue["start"] is not None):
+                continue
+            ref = cue["refs"][0]
+            asset = ref.get("video_asset")
+            if not asset:
+                continue
+            gap = ref["out_frame"] - ref["in_frame"]
+            if gap > 0:
+                pending_inserts.append((round(cue["start"] * FPS), gap, ref, cue))
+        pending_inserts.sort(key=lambda i: i[0])
+        if pending_inserts:
+            def offset(frame):
+                return sum(gap for splice, gap, _, _ in pending_inserts if splice <= frame)
+            for clip in clips:
+                shift = offset(clip["start_frame"])
+                clip["start_frame"] += shift
+                clip["end_frame"] += shift
+            cumulative = 0
+            insert_clips = []
+            for splice, gap, ref, cue in pending_inserts:
+                asset = ref["video_asset"]
+                start = splice + cumulative
+                end = start + gap
+                insert_clips.append({**asset, "name": f"INSERT {ref['label']} | {asset['title']}",
+                                      "start_frame": start, "end_frame": end, "in_frame": ref["in_frame"],
+                                      "passage": cue["passage"], "source_url": ref["target"],
+                                      "doc_order": cue.get("doc_order", 0),
+                                      "requested_source_start": ref["source_start"],
+                                      "requested_source_end": ref["source_end"]})
+                audio_inserts.append((splice, gap))
+                cumulative += gap
+            clips.extend(insert_clips)
+            video_edits.extend(insert_clips)
+            frames += cumulative
     clips.sort(key=lambda c: c["start_frame"])
     # Bridge only tiny speech pauses. Preserve sentence end points across substantive gaps.
     for left, right in zip(clips, clips[1:]):
@@ -1051,9 +1140,9 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
             writer.writerow([c["name"], round(c["start_frame"]/FPS, 3), round(c["end_frame"]/FPS, 3),
                              c["start_frame"], c["end_frame"], c["passage"], c["path"], c.get("source_url", "")])
     xml_sequence(out / "Skeleton_full.xml", "Script skeleton - full", clips, gaps, cues, wav, duration, width, height,
-                 source_audio_enabled=True, unconfirmed=unconfirmed_clips)
+                 source_audio_enabled=True, unconfirmed=unconfirmed_clips, audio_inserts=audio_inserts)
     xml_sequence(out / "Skeleton_test_45s.xml", "Script skeleton - first 45 seconds", clips, gaps, cues, wav, duration, width, height, 45,
-                 source_audio_enabled=True, unconfirmed=unconfirmed_clips)
+                 source_audio_enabled=True, unconfirmed=unconfirmed_clips, audio_inserts=audio_inserts)
     validate_xml(out / "Skeleton_full.xml")
     validate_xml(out / "Skeleton_test_45s.xml")
     if video_selects:

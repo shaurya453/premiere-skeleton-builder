@@ -42,6 +42,21 @@ class YouTubeTests(unittest.TestCase):
         self.assertEqual(edits[0]['in_frame'],round(30*FPS))
         self.assertTrue(any('trimmed' in x for x in cues[0]['review']))
 
+    def test_insert_cues_are_skipped_not_placed_as_overlays(self):
+        # A hard-insert cue's start==end (a splice point, not a matched passage) would
+        # otherwise collapse to a zero-duration, invisible placement under the normal
+        # narration-capped `take` math - build() splices it into the timeline separately.
+        asset = {'kind': 'video', 'path': 'source.mp4', 'title': 'Example', 'width': 1920,
+                 'height': 1080, 'source_duration_frames': 6000, 'has_audio': True}
+        cues = [{'kind': 'video', 'start': 10, 'end': 10, 'passage': '(insert)', 'review': [],
+                 'insert': True,
+                 'refs': [{'label': '2:06 - 2:19', 'target': 'https://youtu.be/fftGair1ZoA',
+                           'source_start': 126, 'source_end': 139, 'video_asset': asset,
+                           'in_frame': round(30 * FPS), 'out_frame': round(43 * FPS)}]}]
+        edits, selects = place_video_clips(cues, [], 9000)
+        self.assertEqual(edits, [])
+        self.assertEqual(selects, [])
+
     def test_xml_keeps_source_handles_and_linked_disabled_sound(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

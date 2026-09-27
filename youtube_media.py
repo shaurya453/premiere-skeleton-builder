@@ -297,7 +297,10 @@ def place_video_clips(cues, images, sequence_frames):
     edits, selects, cursor = [], [], 0
     all_cue_starts = sorted(round(c["start"]*FPS) for c in cues if c["start"] is not None)
     for cue in cues:
-        if cue["kind"] != "video" or cue["start"] is None:
+        if cue["kind"] != "video" or cue["start"] is None or cue.get("insert"):
+            # An insert is a splice, not an overlay - its zero-width start==end would otherwise
+            # pass through the narration-capped `take` math below and collapse to a silent,
+            # invisible placement. build() splices it into the timeline separately instead.
             continue
         position = round(cue["start"]*FPS)
         passage_end = min(sequence_frames, round(cue["end"]*FPS))
