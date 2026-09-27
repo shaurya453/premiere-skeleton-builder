@@ -12,15 +12,21 @@ class PartialLinkTests(unittest.TestCase):
         self.assertEqual([raw[l['start']:l['end']] for l in result],['00:25 - 00:37','5:39 - 5:49'])
         self.assertEqual(warnings,[])
 
-    def test_named_bookmark_and_unrelated_web_link(self):
+    def test_named_bookmark_and_plain_web_link_are_both_image_cues(self):
+        # Any link inline in the narration is treated as visual media - no "IMG" label
+        # needed - since a plain reference/citation link belongs in its own separate
+        # section in this house format, never inline next to the spoken script.
         raw='A giant bee mascot appears.'
         links=[{'start':2,'end':18,'target':'https://docs.google.com/document/d/test/edit#bookmark=id.bee'},
                {'start':19,'end':26,'target':'https://example.com'}]
         asset={'path':'bee.png'}
         found=visual_links(raw,links,{'bee':asset},[])
-        self.assertEqual(len(found),1)
+        self.assertEqual(len(found),2)
         self.assertEqual(found[0]['asset'],asset)
         self.assertTrue(found[0]['inline'])
+        self.assertEqual(found[1]['kind'],'image')
+        self.assertEqual(found[1]['asset'],{'path':None,'remote':'https://example.com'})
+        self.assertFalse(found[1]['inline'])
 
     def test_ambiguous_range_is_flagged_instead_of_guessed(self):
         raw='0:25 - 0:37'

@@ -65,14 +65,15 @@ def bookmark_id(target):
 def visual_links(raw, links, bookmark_images, warnings, fetch_image=None):
     """Recover complete range text even when only part is a hyperlink.
 
-    Video cue: a time range (1:20-1:45) overlapping a link to YouTube, another video
-    site, a direct video file or a Google Drive video. Image cue: a bookmark link to an
-    embedded picture, or an image URL / page link labelled IMG. `fetch_image(url)`
-    downloads web images; without it (script inspection) they are only counted.
+    Video cue: a time range (1:20-1:45) overlapping a link, or a link whose URL itself
+    carries a start time (YouTube's "?t="). Image cue: everything else - a bookmark link
+    to an embedded picture, or any other link, is treated as a reference to visual media,
+    since a link inline in the narration is never a plain citation in this house format
+    (those live in their own separate section instead). `fetch_image(url)` downloads web
+    images; without it (script inspection) they are only counted.
     """
     from youtube_media import source_range, url_timestamp_seconds
     from web_media import identify_source, is_direct_image_url, is_http
-    from drive_audio import is_drive_url
     def video_link(target):
         return is_http(target) and not is_direct_image_url(target)
     # A range's separator is usually a dash, but "0:00 to 0:07" (the word "to") is also common.
@@ -100,13 +101,32 @@ def visual_links(raw, links, bookmark_images, warnings, fetch_image=None):
             continue
         target = link['target']
         asset = bookmark_images.get(bookmark_id(target))
-        explicit = bool(re.search(r'\bIMG(?:\s*\d+)?\s*$', label, re.I) or
-                        (label.strip().isdigit() and 'IMG' in raw[max(0,link['start']-15):link['start']]))
-        # A Drive share link is treated as an image candidate unconditionally - unlike a
-        # generic web page, it's never a plausible "plain reference" link, and requiring an
-        # "IMG" label on top of it (as for other page links) just drops real images that
-        # happen to be unlabelled.
-        remote = not asset and is_http(target) and (is_direct_image_url(target) or explicit or is_drive_url(target))
+        # A same-document bookmark reference - a plain internal anchor, or a Google-Docs-
+        # exported "#bookmark=id.xxx" link (which carries an https scheme despite pointing
+        # within the doc, not out to the web) - is never itself a fetchable image URL, even
+        # once it fails to resolve to an embedded picture below.
+        is_bookmark_ref = not is_http(target) or "bookmark=" in target
+        if not is_bookmark_ref and id(link) not in used and video_link(target) and not asset:
+            point = url_timestamp_seconds(target)
+            if point is not None:
+                # The URL itself carries a usable start time (e.g. a YouTube share link's
+                # "?t=256&si=..."), so use it regardless of what the visible label looks
+                # like - the link's actual target is a more reliable source of truth than
+                # the label text once it resolves to a real timestamp.
+                result.append({**link, 'kind':'video', 'asset':None, 'point_start':point})
+                continue
+            if re.search(r'\d+:\d{2}', label):
+                warnings.append(f"Video timestamp needs a complete start/end range: {label}")
+                continue
+        # Everything else that reaches here is treated as an image reference: a bookmark
+        # already resolved (or attempted) to an embedded picture, a direct image URL or
+        # Drive share, or any other plain web link - a link inline in the narration is
+        # always meant to be visual media in this house format (a citation/source link goes
+        # in its own section, never inline), so no "IMG" label is required to recognize one.
+        # A falsy asset here (bookmark never attached, or the fetch below fails) still
+        # produces a cue - read_docx's caller warns "Missing bookmark/image" for it and
+        # keeps a manual-review slot rather than dropping the reference entirely.
+        remote = not asset and not is_bookmark_ref and is_http(target)
         if remote:
             if fetch_image is None:
                 asset = {"path": None, "remote": target}
@@ -114,31 +134,10 @@ def visual_links(raw, links, bookmark_images, warnings, fetch_image=None):
                 try:
                     asset = fetch_image(target)
                 except Exception as error:
+                    # Still place the cue (asset stays None) rather than dropping it - a
+                    # failed download lands on the manual-review track instead of vanishing.
                     warnings.append(f"Could not download image {target}: {error}")
-        if asset or explicit or remote:
-            result.append({**link, 'kind':'image', 'asset':asset, 'inline':bool(asset and not explicit and not remote)})
-        elif not is_http(target) or "bookmark=" in target:
-            # Looks like a reference to a same-document bookmark (internal anchor, or a
-            # Google-Docs-exported "#bookmark=id.xxx" link) that never resolved to an
-            # embedded image, regardless of whether the label text says "IMG" - surface it
-            # instead of silently dropping the cue.
-            warnings.append(f"Missing bookmark/image for {label}: {target}")
-        elif (id(link) not in used and video_link(target) and
-              (point := url_timestamp_seconds(target)) is not None):
-            # The URL itself carries a usable start time (e.g. a YouTube share link's
-            # "?t=256&si=..."), so use it regardless of what the visible label looks like -
-            # a plain phrase with no timestamp text at all, a single-point caption like
-            # "Link at 00:03" or "02:28" (not a range, but still just one clock reading), or
-            # anything else. The label's own text is never a more reliable source of truth
-            # than the link's actual target once the target resolves to a real timestamp.
-            result.append({**link, 'kind':'video', 'asset':None, 'point_start':point})
-        elif id(link) not in used and video_link(target) and re.search(r'\d+:\d{2}',label):
-            warnings.append(f"Video timestamp needs a complete start/end range: {label}")
-        else:
-            # Any other http(s) link that isn't part of a video timestamp range and wasn't
-            # recognized as an image - surface it so a future recognition gap is a visible
-            # warning instead of silently vanishing.
-            warnings.append(f"Unrecognized link (not video, image, or bookmark): {label}: {target}")
+        result.append({**link, 'kind':'image', 'asset':asset, 'inline':bool(asset and not remote)})
     return sorted(result, key=lambda l:l['start'])
 
 

@@ -135,15 +135,19 @@ class VisualLinkTests(unittest.TestCase):
         self.assertEqual(fetched, [target])
         self.assertEqual(found[0]["kind"], "image")
 
-    def test_unrecognized_http_link_warns_instead_of_vanishing(self):
-        # A plain http(s) link that isn't a video, a recognized image, or a bookmark used to
-        # vanish from the output with zero trace. It should at least produce a warning now.
+    def test_plain_http_link_is_treated_as_an_image_reference(self):
+        # A link inline in the narration is always meant to be visual media in this house
+        # format - a plain citation/source link belongs in its own separate section, never
+        # inline - so a plain page link with no other signal is an image cue by default,
+        # no "IMG" label required.
         raw = "check this out here"
         links = [{"start": raw.index("this out"), "end": raw.index("this out") + len("this out"), "target": "https://example.com/some-page"}]
         warnings = []
         found = visual_links(raw, links, {}, warnings, None)
-        self.assertEqual(found, [])
-        self.assertTrue(any("Unrecognized link" in w for w in warnings))
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["kind"], "image")
+        self.assertEqual(found[0]["asset"], {"path": None, "remote": "https://example.com/some-page"})
+        self.assertEqual(warnings, [])
 
     def test_phrase_linked_straight_to_a_video_url_with_a_start_time_is_a_video_cue(self):
         # A common real-world style: no visible timestamp range in the script text at all -
