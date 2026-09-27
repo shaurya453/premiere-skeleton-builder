@@ -614,7 +614,15 @@ def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, hei
     video = sub(media, "video")
     sample(sub(video, "format"), width, height)
 
-    source_audio = []
+    # Keyed by track_index (not one flat list) so each video-track group's source audio gets
+    # its own sequence audio track pair below, instead of all three groups' clips being merged
+    # onto one shared pair - V2 and V3 clips are deliberately allowed to overlap in time (a V3
+    # "unsynced" item with no free gap still gets placed at its natural length, overlapping the
+    # confirmed clip it couldn't fit next to - see the unconfirmed-placement pass above), which
+    # is harmless for the *video* tracks since they're already separate, but was invalid for
+    # their audio if it all landed on one shared track: validate_xml() would then reject the
+    # overlapping/out-of-order clips as an "Invalid clip range".
+    source_audio = {0: [], 1: [], 2: []}
     # V1 = guide cards (true gaps), V2 = confirmed/aligned media, V3 = resolved media the
     # pipeline couldn't confidently time against the narration ("unsynced").
     for track_index, items in enumerate((gaps, clips, unconfirmed)):
@@ -654,7 +662,7 @@ def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, hei
                 sub(ac, "depth", 16)
                 sub(ac, "samplerate", 48000)
                 sub(am, "channelcount", 2)
-                source_audio.append((clip, item, start, end, cid, f.get("id"), track_index+1, index+1))
+                source_audio[track_index].append((clip, item, start, end, cid, f.get("id"), track_index+1, index+1))
             motion(clip, min(width/item["width"], height/item["height"]) * 100)
             logging = sub(clip, "logginginfo")
             sub(logging, "description", item.get("passage", "Temporary guide; replace with footage"))
@@ -691,42 +699,48 @@ def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, hei
         sub(source, "trackindex", 1)
         sub(track, "enabled", "TRUE")
         sub(track, "locked", "FALSE")
-    # Stereo source sound is linked on its own tracks so it can be muted per-clip
-    # in Premiere if it ever competes with narration.
-    for channel in (1, 2):
-        if not source_audio:
-            break
-        track = sub(audio, "track")
-        for ai, (video_clip, item, start, end, cid, fid, vi, vc) in enumerate(source_audio):
-            audio_id = f"{cid}-audio-{channel}"
-            clip = sub(track, "clipitem", id=audio_id)
-            sub(clip, "name", item["name"] + f" - source audio {channel}")
-            sub(clip, "enabled", "TRUE" if source_audio_enabled else "FALSE")
-            sub(clip, "duration", item["source_duration_frames"])
-            rate(clip)
-            for key, value in [("start", start), ("end", end), ("in", item["in_frame"]),
-                               ("out", item["in_frame"]+end-start)]:
-                sub(clip, key, value)
-            sub(clip, "file", id=fid)
-            source = sub(clip, "sourcetrack")
-            sub(source, "mediatype", "audio")
-            sub(source, "trackindex", channel)
-            related = [(cid, "video", vi, vc),
-                       (cid+"-audio-1", "audio", (1 if audio_path else 0)+1, ai+1),
-                       (cid+"-audio-2", "audio", (1 if audio_path else 0)+2, ai+1)]
-            owners = [clip, video_clip] if channel == 1 else [clip]
-            for owner in owners:
-                for linked_id, kind, ti, ci in related:
-                    link = sub(owner, "link")
-                    sub(link, "linkclipref", linked_id)
-                    sub(link, "mediatype", kind)
-                    sub(link, "trackindex", ti)
-                    sub(link, "clipindex", ci)
-                    if kind == "audio":
-                        sub(link, "groupindex", 1)
-        sub(track, "enabled", "TRUE")
-        sub(track, "locked", "FALSE")
-        sub(track, "outputchannelindex", channel)
+    # Stereo source sound is linked on its own tracks so it can be muted per-clip in Premiere if
+    # it ever competes with narration - one stereo pair per originating video-track group (only
+    # for groups that actually have audio-bearing clips), not one pair shared across all of them,
+    # so each pair only ever holds the one group's already-correctly-ordered, non-overlapping
+    # clips (see the comment above source_audio's declaration for why that matters).
+    base_track = 1 if audio_path else 0
+    for group in source_audio.values():
+        if not group:
+            continue
+        for channel in (1, 2):
+            track = sub(audio, "track")
+            for ai, (video_clip, item, start, end, cid, fid, vi, vc) in enumerate(group):
+                audio_id = f"{cid}-audio-{channel}"
+                clip = sub(track, "clipitem", id=audio_id)
+                sub(clip, "name", item["name"] + f" - source audio {channel}")
+                sub(clip, "enabled", "TRUE" if source_audio_enabled else "FALSE")
+                sub(clip, "duration", item["source_duration_frames"])
+                rate(clip)
+                for key, value in [("start", start), ("end", end), ("in", item["in_frame"]),
+                                   ("out", item["in_frame"]+end-start)]:
+                    sub(clip, key, value)
+                sub(clip, "file", id=fid)
+                source = sub(clip, "sourcetrack")
+                sub(source, "mediatype", "audio")
+                sub(source, "trackindex", channel)
+                related = [(cid, "video", vi, vc),
+                           (cid+"-audio-1", "audio", base_track+1, ai+1),
+                           (cid+"-audio-2", "audio", base_track+2, ai+1)]
+                owners = [clip, video_clip] if channel == 1 else [clip]
+                for owner in owners:
+                    for linked_id, kind, ti, ci in related:
+                        link = sub(owner, "link")
+                        sub(link, "linkclipref", linked_id)
+                        sub(link, "mediatype", kind)
+                        sub(link, "trackindex", ti)
+                        sub(link, "clipindex", ci)
+                        if kind == "audio":
+                            sub(link, "groupindex", 1)
+            sub(track, "enabled", "TRUE")
+            sub(track, "locked", "FALSE")
+            sub(track, "outputchannelindex", channel)
+        base_track += 2
     for cue in cues:
         if cue["start"] is None:
             continue

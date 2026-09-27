@@ -8,7 +8,7 @@ from zipfile import ZipFile
 from lxml import etree as ET
 from PIL import Image
 
-from skeleton_builder import read_docx, timed_tokens, xml_sequence, inspect_docx, preview_cues, build, align_cues
+from skeleton_builder import read_docx, timed_tokens, xml_sequence, validate_xml, inspect_docx, preview_cues, build, align_cues
 
 
 class BookmarkTests(unittest.TestCase):
@@ -496,6 +496,32 @@ class XmlTests(unittest.TestCase):
             self.assertEqual(clip.findtext("filter/effect/parameter/value"), "54.000000")
             self.assertIn("%20%26%20", clip.findtext("file/pathurl"))
             self.assertEqual(xml.findtext(".//sequence/rate/ntsc"), "TRUE")
+
+    def test_overlapping_confirmed_and_unconfirmed_video_audio_get_separate_tracks(self):
+        # Regression for a real crash: validate_xml raised "Invalid clip range" because a V3
+        # ("unsynced") clip is deliberately allowed to overlap a V2 (confirmed) clip in time
+        # (see xml_sequence's source_audio comment) when it has no free gap to slot into - fine
+        # for the video tracks, which are already separate, but their source audio used to be
+        # merged onto one shared audio track regardless of which group it came from.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            video_path = root / "video.mp4"
+            video_path.write_bytes(b"fake")
+            confirmed = {"name": "Confirmed clip", "start_frame": 0, "end_frame": 100,
+                         "path": str(video_path), "width": 640, "height": 360, "kind": "video",
+                         "has_audio": True, "source_duration_frames": 100, "in_frame": 0}
+            unconfirmed = {"name": "Unconfirmed clip", "start_frame": 50, "end_frame": 150,
+                           "path": str(video_path), "width": 640, "height": 360, "kind": "video",
+                           "has_audio": True, "source_duration_frames": 150, "in_frame": 0}
+            path = root / "output.xml"
+            xml_sequence(path, "Test", [confirmed], [], [], None, 10, 1920, 1080,
+                         unconfirmed=[unconfirmed])
+            validate_xml(path)  # must not raise "Invalid clip range"
+            tracks = ET.parse(str(path)).findall(".//sequence/media/audio/track")
+            # One stereo pair per group with audio-bearing clips, not one pair shared across
+            # both: 2 tracks for the confirmed clip's source audio, 2 more for the
+            # unconfirmed one's (no voiceover track here, since audio_path is None).
+            self.assertEqual(len(tracks), 4)
 
 
 if __name__ == "__main__":
