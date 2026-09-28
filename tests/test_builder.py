@@ -392,6 +392,49 @@ class BookmarkTests(unittest.TestCase):
             self.assertEqual(inserts[0]["script_start"], inserts[0]["script_end"])
             self.assertEqual(inserts[0]["refs"][0]["target"], "https://youtu.be/fftGair1ZoA")
 
+    def test_autolinkified_url_label_does_not_pollute_narration_tokens(self):
+        # A real scriptwriter habit: paste a bare URL, which Google Docs auto-linkifies with
+        # the URL text itself as the visible label. A whole paragraph of these (a reference
+        # block) used to feed every word of the URL into the ASR-matching corpus as if it
+        # were spoken narration, contaminating alignment for anything scanned afterward.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            doc = '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>
+                     <w:p><w:r><w:t>Officers arrived at the scene.</w:t></w:r></w:p>
+                     <w:p><w:hyperlink r:id="h1"><w:r><w:t>https://www.facebook.com/AETV/videos/mauricio-guerrero-tries-to-convince-jury</w:t></w:r></w:hyperlink></w:p>
+                     <w:p><w:r><w:t>What they found upstairs changed everything.</w:t></w:r></w:p>
+                     </w:body></w:document>'''
+            rels = '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="h1" Target="https://www.facebook.com/AETV/videos/mauricio-guerrero-tries-to-convince-jury"/></Relationships>'''
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+            words, cues, assets, warnings = read_docx(root / "script.docx", root / "assets", fetch_web=False)
+            self.assertEqual(words, ["officers", "arrived", "at", "the", "scene",
+                                      "what", "they", "found", "upstairs", "changed", "everything"])
+            self.assertTrue(any("No preceding narration" in w for w in warnings))
+
+    def test_pronunciation_link_is_excluded_from_cues(self):
+        # (pron: <link>) is a note for the voiceover artist, not an editing instruction - a
+        # link inside one (often a pronunciation clip) must not become an image/video cue
+        # the way every other inline link does, and its URL must not leak into the corpus.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            doc = '''<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+                     xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>
+                     <w:p><w:r><w:t>Mauricio Guerrero (pron: </w:t></w:r><w:hyperlink r:id="h1"><w:r><w:t>https://youtube.com/shorts/xyz</w:t></w:r></w:hyperlink><w:r><w:t>) was arrested.</w:t></w:r></w:p>
+                     </w:body></w:document>'''
+            rels = '''<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+                      <Relationship Id="h1" Target="https://youtube.com/shorts/xyz"/></Relationships>'''
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+            words, cues, assets, warnings = read_docx(root / "script.docx", root / "assets")
+            self.assertEqual(cues, [])
+            self.assertFalse(warnings)
+            self.assertEqual(words, ["mauricio", "guerrero", "was", "arrested"])
+
     def test_wrong_audio_cache_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

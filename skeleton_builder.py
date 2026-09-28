@@ -322,12 +322,29 @@ def read_docx(path, assets_dir, fetch_web=True):
         # Parenthetical material is an editorial/pronunciation note in this input format.
         for match in re.finditer(r"\([^()]*\)", raw):
             clean[match.start():match.end()] = " " * len(match.group())
+        # A pasted URL that Google Docs auto-linkified keeps the URL itself as the link's
+        # visible label - never real narration, whether it sits inline or (commonly) alone
+        # in its own reference-block paragraph. Left in, it pollutes the ASR-matching corpus
+        # with dozens of fake "words" (split out of the URL by the tokenizer) and can leak
+        # into a video cue's spoken passage. Blank it the same way parenthetical text is
+        # blanked, regardless of whether the cue built from this link ends up kept or dropped.
+        for link in paragraph["links"]:
+            label = raw[link["start"]:link["end"]]
+            if re.fullmatch(r"https?://\S+", label.strip()):
+                clean[link["start"]:link["end"]] = " " * (link["end"] - link["start"])
         clean = "".join(clean)
         ptokens = tokens(clean)
         base = len(all_script_tokens)
         all_script_tokens.extend(t[0] for t in ptokens)
         previous = None
-        for link in visual_links(raw, paragraph['links'], bookmark_images, warnings, web_fetch):
+        # A (pron: ...) / (pronunciation: ...) note is a cue for the voiceover artist, not
+        # the editor - a link inside one (often a pronunciation clip) must not be swept up
+        # as a video/image cue the way every other inline link is.
+        pron_spans = [(m.start(), m.end()) for m in
+                      re.finditer(r"\(\s*pron(?:unciation)?\s*:[^()]*\)", raw, re.IGNORECASE)]
+        narration_links = [l for l in paragraph["links"]
+                            if not any(s <= l["start"] and l["end"] <= e for s, e in pron_spans)]
+        for link in visual_links(raw, narration_links, bookmark_images, warnings, web_fetch):
             label = raw[link['start']:link['end']]
             asset = link['asset']
             kind = link['kind']
