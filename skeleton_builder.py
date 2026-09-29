@@ -40,6 +40,10 @@ TOKEN = re.compile(r"[A-Za-z0-9]+(?:['’][A-Za-z0-9]+)?")
 # suggestions can carry hundreds of these, and none of them were ever meant to attach to an
 # image, so warning about each one buries the warnings that are actually actionable.
 GOOGLE_AUTO_BOOKMARK = re.compile(r"^_[0-9a-z]{6,}$")
+# A case divider paragraph: "Case 3: Title" (also "Case 3 - Title" / "Case 3)"). A colon, dash or
+# closing parenthesis (or nothing) must follow the number, so narration like "Case 3 was closed"
+# is never mistaken for one.
+CASE_HEADER = re.compile(r"^\s*case\s*#?\s*(\d+)\s*(?:[:\-–—)]|$)", re.IGNORECASE)
 
 
 def q(prefix, name):
@@ -275,6 +279,7 @@ def read_docx(path, assets_dir, fetch_web=True):
         order_counter = _scan_bookmarks_and_pictures(
             archive, root, relationships, assets_dir, bookmark_names_seen, bookmark_images,
             embedded, warnings, order_start=0, order_of=order_of)
+        main_end = order_counter  # pictures past this point live in headers/footers/footnotes
 
         # Headers/footers/footnotes/endnotes are separate XML parts, each with their own
         # relationships file - a picture placed there is invisible to a pass over document.xml
@@ -314,6 +319,16 @@ def read_docx(path, assets_dir, fetch_web=True):
             if text.strip():
                 paragraphs.append({"text": text, "links": links,
                                    "doc_order": order_of.get(root.getroottree().getpath(p), 0)})
+
+    # Which case each part of the script belongs to, by document order: 0 before the first
+    # "Case N:" divider (the hook/intro), then N for everything up to the next divider.
+    case_headers = [(p["doc_order"], int(m.group(1))) for p in paragraphs
+                    if (m := CASE_HEADER.match(p["text"]))]
+    case_header_orders = [order for order, _ in case_headers]
+
+    def case_at(order):
+        found = bisect.bisect_right(case_header_orders, order) - 1
+        return case_headers[found][1] if found >= 0 else 0
 
     all_script_tokens, cues = [], []
     for paragraph in paragraphs:
@@ -411,6 +426,14 @@ def read_docx(path, assets_dir, fetch_web=True):
                    "refs": [ref]}
             cues.append(cue)
             previous = cue
+    # Only a script that actually has case dividers gets case numbers; without any, "which
+    # case" has no meaning and downstream naming stays as it was.
+    if case_headers:
+        for cue in cues:
+            cue["case"] = case_at(cue["doc_order"])
+        for asset in embedded:
+            if asset.get("doc_order", main_end) < main_end:
+                asset["case"] = case_at(asset["doc_order"])
     return all_script_tokens, cues, embedded, warnings
 
 
@@ -1082,6 +1105,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
         label = ref["label"] if "IMG" in ref["label"].upper() else "IMG " + ref["label"]
         unconfirmed_items.append({**asset, "name": "UNSYNCED " + label, "passage": cue["passage"],
                                   "source_url": ref["target"], "doc_order": cue.get("doc_order", 0),
+                                  "case": cue.get("case", asset.get("case")),
                                   "duration_frames": round(3 * FPS)})
         used_unconfirmed.add(asset["path"])
     for cue, ref in unconfirmed_video_refs:
@@ -1090,7 +1114,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
         unconfirmed_items.append({**asset, "name": f"UNSYNCED VIDEO {ref['label']} | {asset['title']}",
                                   "in_frame": ref["in_frame"], "passage": cue["passage"],
                                   "source_url": ref["target"], "doc_order": cue.get("doc_order", 0),
-                                  "duration_frames": length})
+                                  "case": cue.get("case"), "duration_frames": length})
     unused = [a for a in embedded if a["path"] not in used and a["path"] not in used_unconfirmed]
     for asset in unused:
         unconfirmed_items.append({**asset, "name": "UNSYNCED " + Path(asset["path"]).stem,
@@ -1137,6 +1161,18 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
         resolved_unconfirmed.append({**clip, "start_frame": start, "end_frame": end})
         cursor = end
     unconfirmed_clips = resolved_unconfirmed
+    # Name each V3 item after the case it belongs to and its position among that case's V3
+    # items, in script order: "CASE 3_2" (or "INTRO_1" before the first case). The descriptive
+    # name it had is kept as `original_name`. Items with no case (a script without case
+    # dividers, or a picture from a header/footer) keep their UNSYNCED names.
+    position = {}
+    for clip in sorted(unconfirmed_clips, key=lambda c: (c["doc_order"], c["start_frame"])):
+        case = clip.get("case")
+        if case is None:
+            continue
+        position[case] = position.get(case, 0) + 1
+        clip["original_name"] = clip["name"]
+        clip["name"] = f"{'INTRO' if case == 0 else f'CASE {case}'}_{position[case]}"
     if unconfirmed_clips:
         warnings.append(f"{len(unconfirmed_clips)} item(s) could not be confidently timed against "
                          "the narration; placed on the unsynced track (V3) in script order for manual repositioning.")
@@ -1203,8 +1239,9 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
         "3. Import Timeline/Skeleton_full.xml for the complete sequence.\n\n"
         "V2: editable images and prepared videos, timed against the narration. V3: media the\n"
         "pipeline downloaded/extracted but could not confidently time against the narration\n"
-        "('UNSYNCED ...' clips) - reposition these by hand; they are already the right file,\n"
-        "just not yet at the right timestamp. V1: guide cards in any gap that still has no\n"
+        "(named CASE 3_2 = second such item in case 3; INTRO_1 before the first case; 'UNSYNCED ...'\n"
+        "if the script has no case headings) - reposition these by hand; they are already the right\n"
+        "file, just not yet at the right timestamp. V1: guide cards in any gap that still has no\n"
         "visual reference at all, or where a download genuinely failed (see warnings). A1: narration.\n"
         "A2/A3: linked source-video sound, enabled by default. Mute those clips in Premiere\n"
         "if source sound ever competes with narration.\n"

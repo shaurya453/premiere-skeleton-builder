@@ -581,6 +581,80 @@ class InsertCueAlignmentTests(unittest.TestCase):
         self.assertIsNone(cue["end"])
 
 
+class CaseDetectionTests(unittest.TestCase):
+    def _script(self, root, paragraphs):
+        """Write a docx of plain paragraphs; a "@name" paragraph is an image bookmark + picture."""
+        Image.new("RGB", (60, 40)).save(root / "img.png")
+        body, rels = "", ""
+        for index, text in enumerate(paragraphs, 1):
+            if text.startswith("@"):
+                body += (f'<w:bookmarkStart w:id="{index}" w:name="{text[1:]}"/>'
+                         f'<w:p><a:blip r:embed="a{index}"/></w:p>')
+                rels += f'<Relationship Id="a{index}" Target="media/image{index}.png"/>'
+            else:
+                body += f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>"
+        doc = ('<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+               'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+               'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body>' + body +
+               "</w:body></w:document>")
+        with ZipFile(root / "script.docx", "w") as z:
+            z.writestr("word/document.xml", doc)
+            z.writestr("word/_rels/document.xml.rels",
+                       '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                       + rels + "</Relationships>")
+            for index, text in enumerate(paragraphs, 1):
+                if text.startswith("@"):
+                    z.write(root / "img.png", f"word/media/image{index}.png")
+        return root / "script.docx"
+
+    def test_cases_are_detected_by_divider_and_only_real_dividers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script = self._script(root, [
+                "Welcome to the video.", "@intro_pic",
+                "Case 1: The Wiztale Incident", "@one_a",
+                "Case 2 - Another One", "@two_a", "@two_b",
+                "Case 3 was closed years ago, the narrator says.", "@still_two",
+                "CASE 4) Last", "@four_a"])
+            _, _, embedded, _ = read_docx(script, root / "assets", fetch_web=False)
+            self.assertEqual([a["case"] for a in embedded], [0, 1, 2, 2, 2, 4])
+
+    def test_script_without_case_dividers_has_no_case_numbers(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script = self._script(root, ["Just a story.", "@pic"])
+            _, cues, embedded, _ = read_docx(script, root / "assets", fetch_web=False)
+            self.assertNotIn("case", embedded[0])
+
+    def test_unsynced_items_are_named_by_case_and_position(self):
+        import wave
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            paragraphs = [
+                "Welcome to the quiet valley today", "@intro_pic",
+                "Case 1: First", "Sunlight warmed the misty morning slowly", "@one_a",
+                "Case 2: Second", "Birds sang softly near the old bridge", "@two_a", "@two_b",
+                "Case 3: Third", "The river ran cold under gray winter skies", "@three_a"]
+            script = self._script(root, paragraphs)
+            audio = root / "voice.wav"
+            with wave.open(str(audio), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                wav.writeframes(bytes(2) * 16000 * 40)
+            digest = hashlib.sha256(audio.read_bytes()).hexdigest()
+            spoken = [w for text in paragraphs if not text.startswith("@") for w in text.replace(":", "").split()]
+            (root / "words.json").write_text(json.dumps({"audio_sha256": digest, "words": [
+                {"word": w, "start": i * 0.5, "end": i * 0.5 + 0.4} for i, w in enumerate(spoken)]}))
+            report = build(script, audio, root / "Project" / "Timeline", words=root / "words.json")
+            names = [c["name"] for c in sorted(report["unconfirmed_clips"], key=lambda c: c["start_frame"])]
+            self.assertEqual(names, ["INTRO_1", "CASE 1_1", "CASE 2_1", "CASE 2_2", "CASE 3_1"])
+            self.assertTrue(all(c["original_name"].startswith("UNSYNCED")
+                                for c in report["unconfirmed_clips"]))
+            xml = (root / "Project" / "Timeline" / "Skeleton_full.xml").read_text(encoding="utf8")
+            self.assertIn("CASE 2_2", xml)
+
+
 class UnconfirmedTrackTests(unittest.TestCase):
     def test_unaligned_and_orphan_media_land_on_the_unsynced_track(self):
         # Nothing in the doc should be left for the editor to manually find: an image whose
