@@ -40,6 +40,19 @@ def extract_google_doc_tab(url_or_id: str) -> str | None:
     return match.group(1) if match else None
 
 
+def missing_tab_warning(url_or_id: str) -> str | None:
+    """A caution for a Google Doc link that names no tab, else None.
+
+    Without a "?tab=" the export is every tab of the document concatenated (script, AI review,
+    feedback...), and everything on them is read as narration. A one-tab doc is unaffected, so
+    this is worded as a check rather than an error."""
+    if is_google_doc_url(url_or_id) and not extract_google_doc_tab(url_or_id):
+        return ("This link has no tab in it, so every tab of the document is read, including any "
+                "AI review or feedback tabs. If the doc has other tabs, open the script's tab in "
+                "Google Docs and copy the link from there.")
+    return None
+
+
 def _sanitize_filename(name: str) -> str:
     """Sanitize a filename for Windows, macOS, and Linux."""
     cleaned = re.sub(r'[<>:"/\\|?*]', '_', name).strip()
@@ -113,6 +126,8 @@ def download_google_doc(
     if tab_id:
         export_url += f"&tab={urllib.parse.quote(tab_id)}"
         progress(f"Link points at one tab ({tab_id}); exporting only that tab, not the whole document.")
+    else:
+        progress("Warning: " + missing_tab_warning(url_or_id))
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "

@@ -23,7 +23,7 @@ from jobs import (ROOT, SETTINGS, DEFAULT_PROJECTS, DEFAULT_MEDIA, DEFAULT_MODEL
                    runs, start_job, stop_job, projects_dir, transfer_folder_contents,
                    read_queue, enqueue, dequeue_next, remove_from_queue)
 from skeleton_builder import inspect_docx, parse_case_range, preview_cues
-from google_docs import is_google_doc_url, download_google_doc
+from google_docs import is_google_doc_url, download_google_doc, missing_tab_warning
 from drive_audio import is_drive_url
 from paths import FROZEN
 import updater
@@ -413,6 +413,7 @@ def main(smoke_test: bool = False):
         value = (source if source is not None else script_var.get()).strip()
         if not value:
             return None
+        tab_warning = missing_tab_warning(value)
         if is_google_doc_url(value):
             status("⏳ Downloading Google Doc…")
             try:
@@ -441,6 +442,8 @@ def main(smoke_test: bool = False):
                 f"{found[len(found) // 2] if len(found) > 1 else found[0]}- for the next."))
         if result.get("warnings"):
             note += f" {len(result['warnings'])} warning(s): {result['warnings'][0]}"
+        if tab_warning:
+            note += f"\n⚠ {tab_warning}"
         status(note)
         return value
 

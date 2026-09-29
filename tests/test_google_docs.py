@@ -10,6 +10,7 @@ from google_docs import (
     extract_google_doc_id,
     extract_google_doc_tab,
     is_google_doc_url,
+    missing_tab_warning,
     download_google_doc,
     _sanitize_filename,
     _extract_filename_from_headers,
@@ -45,6 +46,39 @@ class GoogleDocsTests(unittest.TestCase):
         self.assertIsNone(extract_google_doc_tab(
             "https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit"))
         self.assertIsNone(extract_google_doc_tab("1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"))
+
+    def test_link_without_a_tab_gets_a_caution_and_one_with_a_tab_does_not(self):
+        doc = "https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
+        self.assertIn("no tab", missing_tab_warning(doc + "/edit"))
+        self.assertIn("no tab", missing_tab_warning(doc + "/edit?usp=sharing"))
+        self.assertIn("no tab", missing_tab_warning("1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"))
+        self.assertIsNone(missing_tab_warning(doc + "/edit?tab=t.0"))
+        self.assertIsNone(missing_tab_warning(doc + "/edit?usp=sharing&tab=t.abc123"))
+        # Not a Google Doc at all (a local .docx): nothing to say.
+        self.assertIsNone(missing_tab_warning("C:/scripts/script.docx"))
+
+    def test_download_reports_the_caution_through_progress_only_when_no_tab(self):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            z.writestr("word/document.xml", "<w:document/>")
+        docx_bytes = buf.getvalue()
+
+        def fake_urlopen(req, timeout=None):
+            resp = MagicMock()
+            resp.geturl.return_value = req.full_url
+            resp.read.side_effect = [docx_bytes, b""]
+            resp.headers = {}
+            resp.__enter__.return_value = resp
+            resp.__exit__.return_value = False
+            return resp
+
+        doc = "https://docs.google.com/document/d/1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms/edit"
+        for link, expect_warning in ((doc, True), (doc + "?tab=t.0", False)):
+            messages = []
+            with tempfile.TemporaryDirectory() as tmp:
+                with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                    download_google_doc(link, destination_dir=tmp, progress=messages.append)
+            self.assertEqual(any("no tab" in m for m in messages), expect_warning, link)
 
     def test_download_includes_tab_param_in_export_url_when_link_has_one(self):
         buf = io.BytesIO()
