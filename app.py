@@ -22,7 +22,7 @@ except Exception:  # drag and drop is optional
 from jobs import (ROOT, SETTINGS, DEFAULT_PROJECTS, DEFAULT_MEDIA, DEFAULT_MODELS, read_json, write_json,
                    runs, start_job, stop_job, projects_dir, transfer_folder_contents,
                    read_queue, enqueue, dequeue_next, remove_from_queue)
-from skeleton_builder import inspect_docx, preview_cues
+from skeleton_builder import inspect_docx, parse_case_range, preview_cues
 from google_docs import is_google_doc_url, download_google_doc
 from drive_audio import is_drive_url
 from paths import FROZEN
@@ -392,6 +392,10 @@ def main(smoke_test: bool = False):
     inputs_group.columnconfigure(1, weight=1)
     script_var, audio_var = tk.StringVar(), tk.StringVar()
     inspect_status = tk.StringVar(value="Paste a Google Doc link or choose a .docx script.")
+    # Per-run, deliberately not remembered between runs: which editor's share this run is.
+    cases_var = tk.StringVar()
+    cases_hint = tk.StringVar(value="Leave blank to build the whole video. To share it between editors: "
+                                    "1-4 for one, 5- for the next (the voiceover is cut between them).")
 
     def status(text):
         window.after(0, lambda: inspect_status.set(text))
@@ -428,6 +432,13 @@ def main(smoke_test: bool = False):
             status(f"❌ Script check failed: {result.get('error')}")
             return None
         note = f"✓ {Path(value).stem}: {result['image_cues']} image cue(s), {result['video_cues']} video cue(s), {result['word_count']} words."
+        found = result.get("cases") or []
+        if found:
+            note += f" {len(found)} case(s) found ({found[0]}–{found[-1]})."
+            window.after(0, lambda: cases_hint.set(
+                f"This script has cases {found[0]}–{found[-1]}. Leave blank for all, or e.g. "
+                f"{found[0]}-{found[len(found) // 2 - 1] if len(found) > 1 else found[0]} for one editor and "
+                f"{found[len(found) // 2] if len(found) > 1 else found[0]}- for the next."))
         if result.get("warnings"):
             note += f" {len(result['warnings'])} warning(s): {result['warnings'][0]}"
         status(note)
@@ -475,7 +486,11 @@ def main(smoke_test: bool = False):
 
     script_entry = add_input(0, "Script", script_var, "Google Doc link (must be viewable by anyone with the link) or a .docx file.", "*.docx", resolve_script_async)
     audio_entry = add_input(1, "Voiceover", audio_var, "Drop an audio file here, paste a Google Drive link, or browse.", "*.mp3 *.wav *.m4a *.aac *.flac")
-    ttk.Label(inputs_group, textvariable=inspect_status, wraplength=780, justify="left").grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+    ttk.Label(inputs_group, text="Cases", font=(UI_FONT, 10, "bold")).grid(row=4, column=0, sticky="w", pady=(4, 0))
+    ttk.Entry(inputs_group, textvariable=cases_var, width=14).grid(row=4, column=1, sticky="w", padx=8, pady=(4, 0))
+    ttk.Label(inputs_group, textvariable=cases_hint, foreground=MUTED, font=(UI_FONT, 9), wraplength=780,
+              justify="left").grid(row=5, column=1, sticky="w", padx=8)
+    ttk.Label(inputs_group, textvariable=inspect_status, wraplength=780, justify="left").grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 0))
 
     def on_drop(event):
         for raw in window.tk.splitlist(event.data):
@@ -523,6 +538,8 @@ def main(smoke_test: bool = False):
                 audio = audio_var.get().strip()
                 if not audio or not (is_drive_url(audio) or Path(audio).is_file()):
                     raise ValueError("Choose the voiceover: drop an audio file or paste a Google Drive link.")
+                cases = cases_var.get().strip()
+                parse_case_range(cases)  # raises a readable error for anything but 3, 1-4 or 5-
                 width, height = int(settings_vars["width"].get()), int(settings_vars["height"].get())
                 limit_minutes, buffer_minutes = float(settings_vars["limit_minutes"].get()), float(settings_vars["buffer_minutes"].get())
                 if width <= 0 or height <= 0:
@@ -531,7 +548,10 @@ def main(smoke_test: bool = False):
                     raise ValueError("Use a limit of 1–1440 minutes and handles of 0–60 minutes.")
                 root = projects_dir({"projects_dir": settings_vars["projects_dir"].get().strip()})
                 config = {
-                    "docx": docx, "docx_source": script_var.get().strip(), "audio": audio, "title": Path(docx).stem,
+                    "docx": docx, "docx_source": script_var.get().strip(), "audio": audio,
+                    # Named per share so two editors' runs of one script never collide or get confused.
+                    "title": f"{Path(docx).stem} (cases {cases})" if cases else Path(docx).stem,
+                    "cases": cases,
                     "projects_dir": str(root),
                     "media_dir": settings_vars["media_dir"].get().strip(),
                     "videos": settings_vars["videos"].get(), "limit_minutes": limit_minutes, "buffer_minutes": buffer_minutes,

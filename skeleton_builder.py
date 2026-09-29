@@ -266,8 +266,29 @@ def _scan_bookmarks_and_pictures(archive, root, relationships, assets_dir, bookm
     return order
 
 
-def read_docx(path, assets_dir, fetch_web=True):
-    """Read bookmarks in document order, including body-level bookmark nodes."""
+def parse_case_range(text):
+    """"3" -> (3, 3), "1-4" -> (1, 4), "5-" -> (5, None: through the last case), "" -> None."""
+    text = (text or "").strip().lower().replace("–", "-").replace("—", "-").replace(" to ", "-")
+    if not text:
+        return None
+    found = re.fullmatch(r"(\d+)\s*(?:(-)\s*(\d*))?", text)
+    if not found:
+        raise ValueError(f"Cases must look like 3, 1-4 or 5- (got {text!r}).")
+    low = int(found.group(1))
+    high = (int(found.group(3)) if found.group(3) else None) if found.group(2) else low
+    if low < 1 or (high is not None and high < low):
+        raise ValueError(f"Invalid case range {text!r}: cases start at 1 and the end can't precede the start.")
+    return low, high
+
+
+def read_docx(path, assets_dir, fetch_web=True, cases=None, layout=None):
+    """Read bookmarks in document order, including body-level bookmark nodes.
+
+    `cases` = (low, high) keeps only that inclusive range of "Case N:" sections (high None =
+    through the last one; the hook/intro before Case 1 comes along whenever Case 1 is in the
+    range): cues, embedded pictures and downloads are limited to it. The returned script tokens
+    still cover the WHOLE script, so the caller can locate the range's edges in the audio.
+    `layout`, if a dict, receives {"cases": [{number, title, script_start}], "script_length"}."""
     assets_dir.mkdir(parents=True, exist_ok=True)
     web_fetch = (lambda url: __import__('web_media').fetch_image(url, assets_dir)) if fetch_web else None
     warnings = []
@@ -330,9 +351,29 @@ def read_docx(path, assets_dir, fetch_web=True):
         found = bisect.bisect_right(case_header_orders, order) - 1
         return case_headers[found][1] if found >= 0 else 0
 
+    if cases is not None:
+        available = sorted({number for _, number in case_headers})
+        if not available:
+            raise ValueError("This script has no 'Case N:' headings, so it can't be split by case.")
+        low, high = cases
+        if low not in available or (high is not None and high not in available):
+            raise ValueError(f"Cases {low}-{high or ''} were requested, but this script has cases "
+                             f"{', '.join(map(str, available))}.")
+
+    def wanted(order):
+        if cases is None:
+            return True
+        number = case_at(order)
+        if number == 0:  # the hook/intro travels with the range that contains the first case
+            number = case_headers[0][1]
+        return cases[0] <= number and (cases[1] is None or number <= cases[1])
+
+    if layout is not None:
+        layout["cases"] = []
     all_script_tokens, cues = [], []
     for paragraph in paragraphs:
         raw = paragraph["text"]
+        keep = wanted(paragraph["doc_order"])
         clean = list(raw)
         # Parenthetical material is an editorial/pronunciation note in this input format.
         for match in re.finditer(r"\([^()]*\)", raw):
@@ -354,7 +395,11 @@ def read_docx(path, assets_dir, fetch_web=True):
                       re.finditer(r"\(\s*pron(?:unciation)?\s*:[^()]*\)", raw, re.IGNORECASE)]
         narration_links = [l for l in paragraph["links"]
                             if not any(s <= l["start"] and l["end"] <= e for s, e in pron_spans)]
-        found_links = visual_links(raw, narration_links, bookmark_images, warnings, web_fetch)
+        # Outside the selected cases the links are still classified (so their range text is
+        # blanked from the narration corpus exactly as in a full run) but nothing is fetched
+        # and nothing is reported.
+        found_links = visual_links(raw, narration_links, bookmark_images,
+                                   warnings if keep else [], web_fetch if keep else None)
         # A clip's time range ("[1:20-1:35]", or a bare "0:05" label on a start-time link) is
         # a marker, never spoken - blank it like the parenthetical text above so its digits
         # don't join the ASR-matching corpus, and so a paragraph holding only such a marker
@@ -367,8 +412,13 @@ def read_docx(path, assets_dir, fetch_web=True):
         clean = "".join(clean)
         ptokens = tokens(clean)
         base = len(all_script_tokens)
+        if layout is not None and CASE_HEADER.match(raw):
+            layout["cases"].append({"number": int(CASE_HEADER.match(raw).group(1)),
+                                    "title": raw.strip(), "script_start": base})
         all_script_tokens.extend(t[0] for t in ptokens)
         previous = None
+        if not keep:
+            continue
         for link in found_links:
             label = raw[link['start']:link['end']]
             asset = link['asset']
@@ -434,6 +484,16 @@ def read_docx(path, assets_dir, fetch_web=True):
         for asset in embedded:
             if asset.get("doc_order", main_end) < main_end:
                 asset["case"] = case_at(asset["doc_order"])
+    if layout is not None:
+        layout["script_length"] = len(all_script_tokens)
+    if cases is not None:
+        # Pictures outside the selected cases (and any in headers/footers, which belong to no
+        # case) aren't this editor's: drop them, and their extracted files, from the run.
+        def selected(asset):
+            return "case" in asset and wanted(asset["doc_order"])
+        for asset in [a for a in embedded if not selected(a)]:
+            Path(asset["path"]).unlink(missing_ok=True)
+            embedded.remove(asset)
     return all_script_tokens, cues, embedded, warnings
 
 
@@ -448,7 +508,8 @@ def inspect_docx(path):
             with tempfile.TemporaryDirectory(dir=scratch) as tmp_fetch:
                 downloaded = download_google_doc(str_path, destination_dir=tmp_fetch)
                 with tempfile.TemporaryDirectory(dir=scratch) as tmp:
-                    words, cues, embedded, warnings = read_docx(downloaded, Path(tmp), fetch_web=False)
+                    layout = {}
+                    words, cues, embedded, warnings = read_docx(downloaded, Path(tmp), fetch_web=False, layout=layout)
                     image_cues = sum(1 for c in cues if c.get("kind") == "image")
                     video_cues = sum(1 for c in cues if c.get("kind") == "video")
                     return {
@@ -458,6 +519,7 @@ def inspect_docx(path):
                         "image_cues": image_cues,
                         "video_cues": video_cues,
                         "embedded_images": len(embedded),
+                        "cases": [c["number"] for c in layout["cases"]],
                         "warnings": warnings,
                         "is_gdoc": True,
                         "downloaded_filename": downloaded.name,
@@ -470,7 +532,8 @@ def inspect_docx(path):
         return {"valid": False, "error": "Not a valid .docx file"}
     try:
         with tempfile.TemporaryDirectory(dir=scratch) as tmp:
-            words, cues, embedded, warnings = read_docx(path, Path(tmp), fetch_web=False)
+            layout = {}
+            words, cues, embedded, warnings = read_docx(path, Path(tmp), fetch_web=False, layout=layout)
             image_cues = sum(1 for c in cues if c.get("kind") == "image")
             video_cues = sum(1 for c in cues if c.get("kind") == "video")
             return {
@@ -480,6 +543,7 @@ def inspect_docx(path):
                 "image_cues": image_cues,
                 "video_cues": video_cues,
                 "embedded_images": len(embedded),
+                "cases": [c["number"] for c in layout["cases"]],
                 "warnings": warnings
             }
     except Exception as e:
@@ -953,9 +1017,76 @@ def validate_xml(path):
             raise ValueError(f"Timeline media is missing: {parsed}")
 
 
+def _quiet_gap(narration, first, last):
+    """Index k in [first, last) whose gap to word k+1 is the longest silence - the pause
+    between two sections, even when a spoken title or a misheard word sits in between."""
+    return max(range(first, last), key=lambda k: narration[k + 1]["start"] - narration[k]["end"])
+
+
+def _case_cut(script, narration, layout, cases, duration):
+    """Where the selected cases begin and end in the audio.
+
+    Each edge is the middle of the longest silence between the last spoken word of one side
+    and the first spoken word of the other, so two editors' ranges meet at exactly the same
+    instant. Returns (script_start, script_end, cut_start, cut_end, info)."""
+    mapping = token_mapping(script, [w["token"] for w in narration])
+    coverage = len(mapping) / max(1, len(script))
+    if coverage < .65:
+        raise ValueError(f"Script/audio token match is only {coverage:.0%}; can't find the case "
+                         "boundaries in the audio reliably.")
+    mapped = sorted(mapping)
+    low, high = cases
+    headings = layout["cases"]
+    chosen = [i for i, c in enumerate(headings) if low <= c["number"] and (high is None or c["number"] <= high)]
+    # The hook/intro before the first heading travels with the range that holds the first case.
+    script_start = 0 if chosen[0] == 0 else headings[chosen[0]]["script_start"]
+    script_end = headings[chosen[-1] + 1]["script_start"] if chosen[-1] + 1 < len(headings) else len(script)
+
+    def edge(position):
+        """(narration index of the last matched word before `position`, of the first at/after it)."""
+        i = bisect.bisect_left(mapped, position)
+        before = mapping[mapped[i - 1]] if i > 0 else None
+        after = mapping[mapped[i]] if i < len(mapped) else None
+        return before, after
+
+    def said(first, last):
+        return " ".join(w["token"] for w in narration[max(0, first):last + 1])
+
+    before, after = edge(script_start)
+    if after is None:
+        raise ValueError("The selected cases have no spoken narration in the voiceover.")
+    start_silence = end_silence = None
+    if script_start == 0 or before is None:
+        cut_start, previous_ends = 0.0, ""
+    else:
+        k = _quiet_gap(narration, before, after)
+        start_silence = narration[k + 1]["start"] - narration[k]["end"]
+        cut_start = (narration[k]["end"] + narration[k + 1]["start"]) / 2
+        previous_ends = said(k - 5, k)
+    first_word = after
+    before, after = edge(script_end)
+    if script_end >= len(script) or after is None:
+        cut_end, next_starts = duration, ""
+        last_word = mapping[mapped[-1]]
+    else:
+        k = _quiet_gap(narration, before, after)
+        end_silence = narration[k + 1]["start"] - narration[k]["end"]
+        cut_end = (narration[k]["end"] + narration[k + 1]["start"]) / 2
+        next_starts = said(k + 1, k + 6)
+        last_word = before
+    if cut_end <= cut_start or last_word < first_word:
+        raise ValueError("The selected cases have no spoken narration in the voiceover.")
+    return script_start, script_end, cut_start, cut_end, {
+        "cases": [low, high], "cut_start_seconds": round(cut_start, 3), "cut_end_seconds": round(cut_end, 3),
+        "audio_starts_with": said(first_word, first_word + 5), "audio_ends_with": said(last_word - 5, last_word),
+        "previous_case_ends_with": previous_ends, "next_case_starts_with": next_starts,
+        "start_silence_seconds": None if start_silence is None else round(start_silence, 3),
+        "end_silence_seconds": None if end_silence is None else round(end_silence, 3)}
+
+
 def build(docx, audio, out, words=None, width=1920, height=1080,
           download_videos=False, handles=600, full_videos=None, full_video_limit=5400,
-          media_dir=None, audio_dir=None):
+          media_dir=None, audio_dir=None, cases=None):
     out = Path(out).resolve()
     # Match the GUI/job_worker layout (Media/ and Audio/ as siblings of Timeline/, not nested
     # inside it) even when run standalone from the CLI without --media-dir/--audio-dir.
@@ -990,17 +1121,38 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
     if not audio_path_check.is_file():
         raise ValueError(f"Audio file not found: {audio}")
     print("Extracting bookmarked images and narration cues...", flush=True)
-    script, cues, embedded, warnings = read_docx(docx, media_dir / "Images")
+    layout = {}
+    script, cues, embedded, warnings = read_docx(docx, media_dir / "Images", cases=cases, layout=layout)
     narration, method, timing_warnings = timed_tokens(words, audio)
     warnings.extend(timing_warnings)
-    coverage = align_cues(script, cues, narration)
     import av
     with av.open(str(audio)) as container:
         duration = container.duration / av.time_base
+    case_split, cut_start = None, 0.0
+    if cases:
+        # Split by case: keep only this range's stretch of the voiceover, and move every word
+        # time (and so every cue) to be relative to where that stretch begins.
+        script_from, script_to, cut_start, cut_end, case_split = _case_cut(script, narration, layout, cases, duration)
+        duration = cut_end - cut_start
+        script = script[script_from:script_to]
+        for cue in cues:
+            cue["script_start"] -= script_from
+            cue["script_end"] -= script_from
+        narration = [{**w, "start": w["start"] - cut_start, "end": w["end"] - cut_start} for w in narration
+                     if cut_start <= (w["start"] + w["end"]) / 2 < cut_end]
+        label = f"cases {cases[0]}-{cases[1] if cases[1] else 'end'}"
+        print(f"Case split ({label}): voiceover {clock(cut_start)} to {clock(cut_end)}. "
+              f"Starts: \"{case_split['audio_starts_with']}\" ... ends: \"{case_split['audio_ends_with']}\"", flush=True)
+        for edge, silence in (("start", case_split["start_silence_seconds"]), ("end", case_split["end_silence_seconds"])):
+            if silence is not None and silence < .2:
+                warnings.append(f"The pause at the {edge} cut is only {silence:.2f}s long; check that the audio "
+                                "really splits between two cases there.")
+    coverage = align_cues(script, cues, narration)
     audio_dir.mkdir(parents=True, exist_ok=True)
     wav = audio_dir / "voiceover.wav"
     ffmpeg = ffmpeg_exe()
-    subprocess.run([ffmpeg, "-v", "error", "-i", str(audio), "-ar", "48000", "-ac", "1",
+    cut_args = ["-ss", f"{cut_start:.3f}", "-t", f"{duration:.3f}"] if case_split else []
+    subprocess.run([ffmpeg, "-v", "error", *cut_args, "-i", str(audio), "-ar", "48000", "-ac", "1",
                     "-c:a", "pcm_s16le", str(wav)], check=True, **NO_WINDOW)
     guide = media_dir / "visual-to-add.png"
     make_guide(guide, width, height)
@@ -1195,7 +1347,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
               "sources": {"docx": str(Path(docx).resolve()), "audio": str(Path(audio).resolve())},
               "warnings": warnings, "cues": cues, "clips": clips, "gaps": gaps,
               "unconfirmed_clips": unconfirmed_clips,
-              "unused_assets": unused, "embedded_assets": embedded,
+              "unused_assets": unused, "embedded_assets": embedded, "case_split": case_split,
               "video_assets": video_assets, "video_selects": video_selects,
               "video_options": {"enabled": download_videos, "handles_seconds": handles, "full_sources": full_videos, "full_video_limit_seconds": full_video_limit}}
     (data_dir / "manifest.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1273,6 +1425,7 @@ def main():
     p.add_argument("--download-videos", action="store_true")
     p.add_argument("--handles", type=float, default=600, help="Buffer seconds for videos above the full-video limit")
     p.add_argument("--full-video-limit", type=float, default=5400, help="Download complete videos up to this duration in seconds (default 90 minutes)")
+    p.add_argument("--cases", default="", help="Only build these cases, e.g. 3, 1-4 or 5- (through the last); the voiceover is cut to match")
     p.add_argument("--width", type=int, default=1920, help="Sequence width in pixels (default 1920)")
     p.add_argument("--height", type=int, default=1080, help="Sequence height in pixels (default 1080)")
     policy = p.add_mutually_exclusive_group()
@@ -1287,7 +1440,7 @@ def main():
     build(args.docx, args.audio, args.output, args.words,
           width=args.width, height=args.height,
           download_videos=args.download_videos, handles=args.handles, full_videos=args.full_videos, full_video_limit=args.full_video_limit,
-          media_dir=args.media_dir, audio_dir=args.audio_dir)
+          media_dir=args.media_dir, audio_dir=args.audio_dir, cases=parse_case_range(args.cases))
 
 
 if __name__ == "__main__":

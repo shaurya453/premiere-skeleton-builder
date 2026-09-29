@@ -58,6 +58,7 @@ def run(folder):
                             '--full-video-limit', str(c['limit_minutes']*60)]
             if c.get('width'): command += ['--width', str(c['width'])]
             if c.get('height'): command += ['--height', str(c['height'])]
+            if c.get('cases'): command += ['--cases', str(c['cases'])]
             print('Working folder:', folder, flush=True)
             print('You may close and reopen the app; this run continues in the background.', flush=True)
             builder = subprocess.Popen(command, stdin=subprocess.DEVNULL, **NO_WINDOW)

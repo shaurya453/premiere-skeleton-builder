@@ -655,6 +655,139 @@ class CaseDetectionTests(unittest.TestCase):
             self.assertIn("CASE 2_2", xml)
 
 
+class CaseSplitTests(unittest.TestCase):
+    """Two editors, one video: each takes a range of cases; the voiceover is cut between them."""
+    CASES = [
+        ("Case 1: One", "Sunlight warmed the quiet misty valley slowly across the morning while birds sang softly", "b1"),
+        ("Case 2: Two", "Lanterns glowed along the empty harbor road as fishermen coiled their heavy wet ropes", None),
+        ("Case 3: Three", "The river ran cold under gray winter skies while the villagers waited for spring rain", "b3"),
+        ("Case 4: Four", "Copper kettles rattled on the crowded market stalls beneath the striped canvas awnings", None),
+    ]
+
+    def _make(self, root, speak_headings):
+        import re
+        import wave
+        Image.new("RGB", (60, 40)).save(root / "img.png")
+        body, rels, files, spoken, t, sentence_start, section_start = "", "", [], [], 0.0, {}, {}
+        for number, (heading, sentence, bookmark) in enumerate(self.CASES, 1):
+            link = ""
+            if bookmark:
+                link = (f'<w:r><w:t xml:space="preserve"> (</w:t></w:r><w:hyperlink w:anchor="{bookmark}"><w:r>'
+                        f'<w:t>IMG {number}</w:t></w:r></w:hyperlink><w:r><w:t>)</w:t></w:r>')
+            body += (f"<w:p><w:r><w:t>{heading}</w:t></w:r></w:p>"
+                     f'<w:p><w:r><w:t>{sentence}.</w:t></w:r>{link}</w:p>')
+            for k in range(2 if bookmark else 1):
+                name = f"loose{number}" if k or not bookmark else bookmark
+                body += f'<w:bookmarkStart w:id="{number * 10 + k}" w:name="{name}"/><w:p><a:blip r:embed="a{number}{k}"/></w:p>'
+                rels += f'<Relationship Id="a{number}{k}" Target="media/image{number}{k}.png"/>'
+                files.append(f"word/media/image{number}{k}.png")
+            t += 2.0  # the pause between cases
+            section_start[number] = round(t, 3)
+            if speak_headings:
+                for word in re.findall(r"[A-Za-z0-9]+", heading):
+                    spoken.append({"word": word.lower(), "start": round(t, 3), "end": round(t + 0.4, 3)})
+                    t += 0.5
+                t += 0.3
+            for index, word in enumerate(sentence.split()):
+                if index == 0:
+                    sentence_start[number] = round(t, 3)
+                spoken.append({"word": word.lower(), "start": round(t, 3), "end": round(t + 0.4, 3)})
+                t += 0.5
+        doc = ('<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+               'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+               'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body>' + body + "</w:body></w:document>")
+        with ZipFile(root / "script.docx", "w") as z:
+            z.writestr("word/document.xml", doc)
+            z.writestr("word/_rels/document.xml.rels",
+                       '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                       + rels + "</Relationships>")
+            for name in files:
+                z.write(root / "img.png", name)
+        total = t + 2.0
+        audio = root / "voice.wav"
+        with wave.open(str(audio), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(bytes(2) * int(16000 * total))
+        (root / "words.json").write_text(json.dumps({
+            "audio_sha256": hashlib.sha256(audio.read_bytes()).hexdigest(), "words": spoken}))
+        return audio, total, sentence_start, section_start
+
+    def _wav_seconds(self, path):
+        import wave
+        with wave.open(str(path)) as wav:
+            return wav.getnframes() / wav.getframerate()
+
+    def _check_split(self, speak_headings):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio, total, sentence_start, section_start = self._make(root, speak_headings)
+            script = root / "script.docx"
+            first = build(script, audio, root / "A" / "Timeline", words=root / "words.json", cases=(1, 2))
+            second = build(script, audio, root / "B" / "Timeline", words=root / "words.json", cases=(3, 4))
+            a, b = first["case_split"], second["case_split"]
+            # Both editors' audio meets at one instant, inside the pause before case 3 begins
+            # (the pause is the 2s just before section_start[3]).
+            self.assertEqual(a["cut_end_seconds"], b["cut_start_seconds"])
+            self.assertGreater(a["cut_end_seconds"], section_start[3] - 2.0)
+            self.assertLess(a["cut_end_seconds"], section_start[3])
+            self.assertEqual(a["cut_start_seconds"], 0.0)
+            self.assertAlmostEqual(first["duration_seconds"] + second["duration_seconds"], total, delta=0.01)
+            for run, report in (("A", first), ("B", second)):
+                self.assertAlmostEqual(self._wav_seconds(root / run / "Audio" / "voiceover.wav"),
+                                       report["duration_seconds"], delta=0.05)
+            # Each editor only gets their own media: one linked picture and one loose picture per case.
+            self.assertEqual(len(first["embedded_assets"]), 3)
+            self.assertEqual(len(second["embedded_assets"]), 3)
+            self.assertEqual(len(list((root / "A" / "Media" / "Images").glob("*.png"))), 3)
+            self.assertEqual(len(list((root / "B" / "Media" / "Images").glob("*.png"))), 3)
+            self.assertEqual([c["case"] for c in first["cues"]], [1])
+            self.assertEqual([c["case"] for c in second["cues"]], [3])
+            # Case 3's cue lands where its sentence starts, measured from the cut, not from 0:00.
+            self.assertAlmostEqual(second["cues"][0]["start"], sentence_start[3] - b["cut_start_seconds"], delta=0.05)
+            self.assertTrue(all(c["name"].startswith(("CASE 3_", "CASE 4_")) for c in second["unconfirmed_clips"]))
+
+    def test_two_editors_split_the_voiceover_between_their_cases(self):
+        self._check_split(speak_headings=False)
+
+    def test_split_also_works_when_the_vo_reads_the_case_headings_aloud(self):
+        self._check_split(speak_headings=True)
+
+    def test_last_range_runs_to_the_end_and_first_range_holds_the_intro(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio, total, _, _ = self._make(root, False)
+            tail = build(root / "script.docx", audio, root / "T" / "Timeline", words=root / "words.json", cases=(4, None))
+            self.assertAlmostEqual(tail["case_split"]["cut_end_seconds"], total, delta=0.01)
+            self.assertGreater(tail["case_split"]["cut_start_seconds"], 0)
+            head = build(root / "script.docx", audio, root / "H" / "Timeline", words=root / "words.json", cases=(1, 1))
+            self.assertEqual(head["case_split"]["cut_start_seconds"], 0.0)
+
+    def test_requesting_a_missing_case_or_a_script_without_cases_is_an_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio, _, _, _ = self._make(root, False)
+            with self.assertRaisesRegex(ValueError, "has cases 1, 2, 3, 4"):
+                build(root / "script.docx", audio, root / "X" / "Timeline", words=root / "words.json", cases=(7, 8))
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            plain = CaseDetectionTests()._script(root, ["Just a story with no case headings at all.", "@pic"])
+            with self.assertRaisesRegex(ValueError, "no 'Case N:' headings"):
+                read_docx(plain, root / "assets", fetch_web=False, cases=(1, 2))
+
+    def test_case_range_text_is_parsed(self):
+        from skeleton_builder import parse_case_range
+        self.assertIsNone(parse_case_range(""))
+        self.assertEqual(parse_case_range("3"), (3, 3))
+        self.assertEqual(parse_case_range("1-4"), (1, 4))
+        self.assertEqual(parse_case_range(" 5 – 8 "), (5, 8))
+        self.assertEqual(parse_case_range("5-"), (5, None))
+        for bad in ("0", "4-2", "a-b", "1,3"):
+            with self.assertRaises(ValueError):
+                parse_case_range(bad)
+
+
 class UnconfirmedTrackTests(unittest.TestCase):
     def test_unaligned_and_orphan_media_land_on_the_unsynced_track(self):
         # Nothing in the doc should be left for the editor to manually find: an image whose
