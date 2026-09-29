@@ -332,11 +332,6 @@ def read_docx(path, assets_dir, fetch_web=True):
             label = raw[link["start"]:link["end"]]
             if re.fullmatch(r"https?://\S+", label.strip()):
                 clean[link["start"]:link["end"]] = " " * (link["end"] - link["start"])
-        clean = "".join(clean)
-        ptokens = tokens(clean)
-        base = len(all_script_tokens)
-        all_script_tokens.extend(t[0] for t in ptokens)
-        previous = None
         # A (pron: ...) / (pronunciation: ...) note is a cue for the voiceover artist, not
         # the editor - a link inside one (often a pronunciation clip) must not be swept up
         # as a video/image cue the way every other inline link is.
@@ -344,7 +339,22 @@ def read_docx(path, assets_dir, fetch_web=True):
                       re.finditer(r"\(\s*pron(?:unciation)?\s*:[^()]*\)", raw, re.IGNORECASE)]
         narration_links = [l for l in paragraph["links"]
                             if not any(s <= l["start"] and l["end"] <= e for s, e in pron_spans)]
-        for link in visual_links(raw, narration_links, bookmark_images, warnings, web_fetch):
+        found_links = visual_links(raw, narration_links, bookmark_images, warnings, web_fetch)
+        # A clip's time range ("[1:20-1:35]", or a bare "0:05" label on a start-time link) is
+        # a marker, never spoken - blank it like the parenthetical text above so its digits
+        # don't join the ASR-matching corpus, and so a paragraph holding only such a marker
+        # really has no narration (that is what makes it a pause-the-VO clip below).
+        for link in found_links:
+            span = raw[link["start"]:link["end"]]
+            if link["kind"] == "video" and ("point_start" not in link or
+                    re.fullmatch(r"[\s\[\](){}]*\d+:\d{2}(?::\d{2})?(?:\.\d+)?[\s\[\](){}]*", span)):
+                clean[link["start"]:link["end"]] = " " * (link["end"] - link["start"])
+        clean = "".join(clean)
+        ptokens = tokens(clean)
+        base = len(all_script_tokens)
+        all_script_tokens.extend(t[0] for t in ptokens)
+        previous = None
+        for link in found_links:
             label = raw[link['start']:link['end']]
             asset = link['asset']
             kind = link['kind']
@@ -352,7 +362,11 @@ def read_docx(path, assets_dir, fetch_web=True):
             if is_image and not asset:
                 warnings.append(f"Missing bookmark/image for {label}: {link['target']}")
             # Cues separated only by punctuation or other notes share the same passage.
-            anchor = link["end"] if link.get("inline") else link["start"]
+            # A link whose visible text is itself narration (the writer linked the very words
+            # the clip illustrates) anchors at the END of those words, like an embedded image
+            # does - not at their start, which would put the clip on the sentence before them.
+            spoken = any(a < link["end"] and b > link["start"] for _, a, b in ptokens)
+            anchor = link["end"] if (link.get("inline") or spoken) else link["start"]
             end_index = sum(1 for _, _, b in ptokens if b <= anchor)
             ref = {"label": label, "target": link["target"], "asset": asset}
             if "point_start" in link:
@@ -366,15 +380,16 @@ def read_docx(path, assets_dir, fetch_web=True):
             boundaries = list(re.finditer(r"[.!?][\"'’”]*(?=\s+[A-Z])", trimmed))
             begin_char = boundaries[-1].end() if boundaries else 0
             start_index = sum(1 for _, _, b in ptokens if b <= begin_char)
-            if kind == "video":
+            if kind == "video" and not spoken:
                 # A video link describes the paragraph up to the cue, or the portion
                 # since the previous visual cue when several occur in one paragraph.
+                # (A link on spoken words describes its own sentence, like an image.)
                 start_index = 0
             if previous is not None:
                 start_index = (previous["script_start"] - base if previous["local_end"] == end_index
                                else max(start_index, previous["local_end"]))
             if start_index >= end_index:
-                if kind == "video":
+                if kind == "video" and not ptokens:
                     # A video link with no narration anywhere in its own paragraph - the
                     # scriptwriter put its timestamp alone on its own line - means something
                     # different from every other cue: not "illustrate this passage" but "the VO

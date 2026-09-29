@@ -435,6 +435,86 @@ class BookmarkTests(unittest.TestCase):
             self.assertFalse(warnings)
             self.assertEqual(words, ["mauricio", "guerrero", "was", "arrested"])
 
+    def _link_doc(self, *paragraphs):
+        """Parse paragraphs given as lists of ("text" | ("yt"|"range"|"bk", text)) runs.
+
+        "yt" is a YouTube link carrying ?t=100, "range" a plain YouTube link (its range lives
+        in the visible text), "bk" a bookmark link to one embedded image."""
+        def run(part):
+            if isinstance(part, str):
+                return f'<w:r><w:t xml:space="preserve">{part}</w:t></w:r>'
+            rid, text = part
+            return f'<w:hyperlink r:id="{rid}"><w:r><w:t xml:space="preserve">{text}</w:t></w:r></w:hyperlink>'
+        body = "".join("<w:p>" + "".join(run(part) for part in para) + "</w:p>" for para in paragraphs)
+        doc = ('<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+               'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+               'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body>' + body +
+               '<w:bookmarkStart w:id="1" w:name="bk"/><w:p><a:blip r:embed="a1"/></w:p></w:body></w:document>')
+        rels = ('<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                '<Relationship Id="yt" Target="https://youtu.be/fftGair1ZoA?t=100"/>'
+                '<Relationship Id="range" Target="https://youtu.be/fftGair1ZoA"/>'
+                '<Relationship Id="bk" Target="https://docs.google.com/document/d/demo/edit#bookmark=id.bk"/>'
+                '<Relationship Id="a1" Target="media/image1.png"/></Relationships>')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            Image.new("RGB", (60, 40)).save(root / "img.png")
+            with ZipFile(root / "script.docx", "w") as z:
+                z.writestr("word/document.xml", doc)
+                z.writestr("word/_rels/document.xml.rels", rels)
+                z.write(root / "img.png", "word/media/image1.png")
+            return read_docx(root / "script.docx", root / "assets", fetch_web=False)
+
+    def test_start_time_link_on_spoken_words_covers_those_words_wherever_they_sit(self):
+        # The writer linked the very words the clip illustrates: the cue anchors at the end
+        # of those words and its passage is that sentence - never the sentence before it, and
+        # never a pause-the-VO clip just because the linked words open the paragraph.
+        linked = ("yt", "In that clip he defends the decision.")
+        for layout in [["The trial began in March. ", linked, " Then the jury left."],
+                       [linked, " Then the jury left."],
+                       ["The trial began in March. Then the jury left. ", linked],
+                       [linked]]:
+            words, cues, _, warnings = self._link_doc(layout)
+            self.assertEqual(len(cues), 1, layout)
+            self.assertFalse(cues[0].get("insert"), layout)
+            self.assertEqual(cues[0]["passage"], "In that clip he defends the decision", layout)
+            self.assertFalse(warnings, layout)
+            self.assertIn("decision", words)  # linked words stay in the narration
+
+    def test_bookmark_link_on_spoken_words_still_covers_those_words(self):
+        for layout in [["The trial began in March. ", ("bk", "She held up the profile picture."), " Then the jury left."],
+                       [("bk", "She held up the profile picture."), " Then the jury left."]]:
+            _, cues, _, warnings = self._link_doc(layout)
+            self.assertEqual([c["kind"] for c in cues], ["image"])
+            self.assertEqual(cues[0]["passage"], "She held up the profile picture")
+            self.assertFalse(warnings)
+
+    def test_pause_clip_needs_a_paragraph_with_no_narration_at_all(self):
+        # A range alone in its own paragraph pauses the VO; the timestamp's digits are not
+        # narration and must not leak into the ASR-matching words.
+        words, cues, _, warnings = self._link_doc(
+            ["Hello there."], [("range", "[2:00-2:05]")], ["Back to the story."])
+        self.assertEqual(words, ["hello", "there", "back", "to", "the", "story"])
+        self.assertEqual([c.get("insert") for c in cues], [True])
+        self.assertFalse(warnings)
+        # A bare start time on a start-time link is a marker too, not narration.
+        words, cues, _, _ = self._link_doc(["Hello there."], [("yt", "0:05")], ["Back."])
+        self.assertEqual(words, ["hello", "there", "back"])
+        self.assertEqual([c.get("insert") for c in cues], [True])
+        # The same range after some words is an overlay on those words, digits still excluded.
+        words, cues, _, _ = self._link_doc(["Hello there. ", ("range", "[2:00-2:05]"), " More."])
+        self.assertEqual(words, ["hello", "there", "more"])
+        self.assertEqual(len(cues), 1)
+        self.assertFalse(cues[0].get("insert"))
+        self.assertEqual(cues[0]["passage"], "Hello there")
+
+    def test_range_before_narration_in_the_same_paragraph_is_not_a_pause_clip(self):
+        # Narration shares the paragraph, so it is neither "alone" (pause) nor "after some
+        # words" (overlay): warn and leave it for the writer rather than pausing the VO.
+        words, cues, _, warnings = self._link_doc([("range", "[2:00-2:05]"), " Then he left."])
+        self.assertEqual(cues, [])
+        self.assertEqual(words, ["then", "he", "left"])
+        self.assertTrue(any("No preceding narration" in w for w in warnings))
+
     def test_wrong_audio_cache_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
