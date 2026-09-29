@@ -57,6 +57,57 @@ class YouTubeTests(unittest.TestCase):
         self.assertEqual(edits, [])
         self.assertEqual(selects, [])
 
+    def _prepare_point_ref(self, point, duration, handles=10):
+        # Runs prepare_sources for one "?t=" link with the download and ffmpeg steps stubbed,
+        # so only the window/handle/focus math is exercised.
+        from unittest.mock import patch
+        import youtube_media
+        ref = {'label': 'clip', 'target': 'https://youtu.be/fftGair1ZoA?t=%d' % point, 'point_start': float(point)}
+        cue = {'kind': 'video', 'refs': [ref], 'review': []}
+        info = {'id': 'fftGair1ZoA', 'title': 'Example', 'duration': duration, 'source_url': ref['target'],
+                'download_offset_seconds': 0, 'download_end_seconds': duration}
+        # probe() reports the prepared window, not the whole video
+        prepared = min(duration, point + 15 + handles) - max(0, point - 15 - handles)
+        frames = round(prepared * FPS)
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.object(youtube_media, 'download_source', return_value=(Path(tmp) / 'o.mp4', info)), \
+             patch.object(youtube_media, 'probe', return_value={'duration': prepared, 'frames': frames, 'has_audio': True}), \
+             patch.object(youtube_media.subprocess, 'run'):
+            youtube_media.prepare_sources([cue], tmp, handles=handles, full=False, cache=Path(tmp) / 'cache')
+        return cue, ref
+
+    def test_point_link_becomes_a_30_second_window_with_handles(self):
+        cue, ref = self._prepare_point_ref(100, 600)
+        self.assertEqual((ref['source_start'], ref['source_end']), (85, 115))
+        # 10s handles: the prepared source runs 75s-125s, so the window sits 10s in.
+        self.assertEqual(ref['in_frame'], round(10 * FPS))
+        self.assertEqual(ref['out_frame'], round(40 * FPS))
+        self.assertEqual(ref['focus_frame'], round(25 * FPS))
+
+    def test_point_link_window_clamps_at_start_and_end_of_video(self):
+        _, early = self._prepare_point_ref(5, 600)
+        self.assertEqual((early['source_start'], early['source_end']), (0, 20))
+        self.assertEqual(early['in_frame'], 0)
+        self.assertEqual(early['focus_frame'], round(5 * FPS))
+        cue, late = self._prepare_point_ref(100, 110)
+        self.assertEqual(late['out_frame'], round(35 * FPS))
+        self.assertTrue(any('clamped' in note for note in cue['review']))
+
+    def test_point_link_overlay_starts_at_the_pointed_moment_but_selects_keep_the_window(self):
+        asset = {'kind': 'video', 'path': 'source.mp4', 'title': 'Example', 'width': 1920,
+                 'height': 1080, 'source_duration_frames': 6000, 'has_audio': True}
+        cues = [{'kind': 'video', 'start': 10, 'end': 16, 'passage': 'Narration', 'review': [],
+                 'refs': [{'label': 'clip', 'target': 'https://youtu.be/fftGair1ZoA?t=100',
+                           'point_start': 100.0, 'source_start': 85, 'source_end': 115, 'video_asset': asset,
+                           'in_frame': round(10 * FPS), 'out_frame': round(40 * FPS),
+                           'focus_frame': round(25 * FPS)}]}]
+        edits, selects = place_video_clips(cues, [], 9000)
+        self.assertEqual(edits[0]['in_frame'], round(25 * FPS))
+        self.assertEqual(edits[0]['requested_source_start'], 100.0)
+        self.assertEqual(edits[0]['end_frame'] - edits[0]['start_frame'], round(16 * FPS) - round(10 * FPS))
+        self.assertEqual(selects[0]['in_frame'], round(10 * FPS))
+        self.assertEqual(selects[0]['end_frame'] - selects[0]['start_frame'], round(40 * FPS) - round(10 * FPS))
+
     def test_xml_keeps_source_handles_and_linked_disabled_sound(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

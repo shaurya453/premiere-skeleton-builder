@@ -58,7 +58,7 @@ def source_range(label):
 # A common bookmarking style hyperlinks a plain phrase straight to a video URL carrying a
 # single start-time param (e.g. a YouTube share link's "?t=256&si=..." or "?t=4m19s"), with no
 # visible timestamp range in the script text at all - source_range() has nothing to parse there.
-POINT_REFERENCE_DURATION = 3.0  # seconds; matches the default given to an unsynced image.
+POINT_REFERENCE_PADDING = 15.0  # seconds kept before and after the linked moment (a 30s window)
 
 
 def url_timestamp_seconds(url):
@@ -208,7 +208,8 @@ def prepare_sources(cues, output, handles=600, full=None, cache=None, full_limit
             try:
                 kind, identifier, url = identify_source(ref["target"])
                 if "point_start" in ref:
-                    a, b = ref["point_start"], ref["point_start"] + POINT_REFERENCE_DURATION
+                    point = ref["point_start"]
+                    a, b = max(0.0, point - POINT_REFERENCE_PADDING), point + POINT_REFERENCE_PADDING
                 else:
                     a, b = source_range(ref["label"])
                 ref.update(video_id=identifier, source_start=a, source_end=b)
@@ -275,6 +276,9 @@ def prepare_sources(cues, output, handles=600, full=None, cache=None, full_limit
                 ref["video_asset"] = asset
                 ref["in_frame"] = round((ref["source_start"]-a)*FPS)
                 ref["out_frame"] = min(frame_count, round((ref["source_end"]-a)*FPS))
+                if "point_start" in ref:
+                    # The pointed moment inside the 30s window: an inline overlay starts here.
+                    ref["focus_frame"] = round((ref["point_start"]-a)*FPS)
                 if ref["out_frame"] <= ref["in_frame"]:
                     raise ValueError("Selected excerpt is empty after conversion")
         except Exception as error:
@@ -320,12 +324,19 @@ def place_video_clips(cues, images, sequence_frames):
                     "source_notes": [ref["source_warning"]] if ref.get("source_warning") else []}
             selects.append({**base, "start_frame": cursor, "end_frame": cursor+length})
             cursor += length
-            take = min(length, passage_end-position)
+            # A link that only carries a start time ("?t=") is kept as a 30s window in the
+            # selects, but the inline overlay itself starts at the pointed moment.
+            focus = ref.get("focus_frame")
+            edit_base, edit_length = base, length
+            if focus is not None and source_in < focus < source_out:
+                edit_length = source_out-focus
+                edit_base = {**base, "in_frame": focus, "requested_source_start": ref["point_start"]}
+            take = min(edit_length, passage_end-position)
             if take > 0:
-                edits.append({**base, "start_frame": position, "end_frame": position+take})
+                edits.append({**edit_base, "start_frame": position, "end_frame": position+take})
                 ref["timeline_start_frame"], ref["timeline_end_frame"] = position, position+take
                 position += take
-            if take < length:
+            if take < edit_length:
                 cue["review"].append(f"{ref['label']}: full excerpt is longer than available narration; main edit trimmed, exact range in Source_Selects.xml")
         if position < passage_end:
             cue["review"].append("Excerpt is shorter than narration; remaining passage left for editor")
