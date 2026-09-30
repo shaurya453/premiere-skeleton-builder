@@ -281,6 +281,29 @@ def parse_case_range(text):
     return low, high
 
 
+def case_range_for(selected, all_numbers):
+    """The range text for the cases ticked in the app: "" for the whole video, "3", or "1-4".
+    The splitter cuts one contiguous stretch, so a gap between ticks is filled in."""
+    ticked = {n for n in selected if n in all_numbers}
+    if not ticked:
+        raise ValueError("Tick at least one case.")
+    covered = [n for n in all_numbers if min(ticked) <= n <= max(ticked)]
+    if len(covered) == len(all_numbers):
+        return ""
+    return str(covered[0]) if len(covered) == 1 else f"{covered[0]}-{covered[-1]}"
+
+
+def _case_summary(layout, cues):
+    """One entry per case heading for the app's case list."""
+    summary = []
+    for heading in layout.get("cases", []):
+        mine = [c for c in cues if c.get("case") == heading["number"]]
+        summary.append({"number": heading["number"], "title": heading["title"],
+                        "image_cues": sum(1 for c in mine if c.get("kind") == "image"),
+                        "video_cues": sum(1 for c in mine if c.get("kind") == "video")})
+    return summary
+
+
 def read_docx(path, assets_dir, fetch_web=True, cases=None, layout=None):
     """Read bookmarks in document order, including body-level bookmark nodes.
 
@@ -520,6 +543,7 @@ def inspect_docx(path):
                         "video_cues": video_cues,
                         "embedded_images": len(embedded),
                         "cases": [c["number"] for c in layout["cases"]],
+                        "case_list": _case_summary(layout, cues),
                         "warnings": warnings,
                         "is_gdoc": True,
                         "downloaded_filename": downloaded.name,
@@ -544,6 +568,7 @@ def inspect_docx(path):
                 "video_cues": video_cues,
                 "embedded_images": len(embedded),
                 "cases": [c["number"] for c in layout["cases"]],
+                "case_list": _case_summary(layout, cues),
                 "warnings": warnings
             }
     except Exception as e:
@@ -628,13 +653,15 @@ def _describe_unmatched_regions(script_tokens, mapping, min_run=150, limit=5):
     return "\n".join(lines)
 
 
-def align_cues(script_tokens, cues, narration):
+def align_cues(script_tokens, cues, narration, mapping_out=None):
     mapping = token_mapping(script_tokens, [w["token"] for w in narration])
     coverage = len(mapping) / max(1, len(script_tokens))
     if coverage < .65:
         detail = _describe_unmatched_regions(script_tokens, mapping)
         raise ValueError(f"Script/audio token match is only {coverage:.0%}; refusing to guess a whole timeline."
                           + (f"\n{detail}" if detail else ""))
+    if mapping_out is not None:
+        mapping_out.update(mapping)
     mapped = sorted(mapping)
     for cue in cues:
         if cue.get("insert"):
@@ -744,8 +771,12 @@ def motion(clip, scale):
 
 
 def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, height, limit=None,
-                 source_audio_enabled=False, unconfirmed=(), audio_inserts=()):
+                 source_audio_enabled=False, unconfirmed=(), audio_inserts=(), case_markers=(), audio_offset=0, audio_frames=None):
     orig_frames = math.ceil(duration * FPS)
+    # The voiceover file can be longer than this sequence (a case split keeps the whole recording
+    # so its ends can be trimmed out again): audio_offset is where in the file the sequence's
+    # first frame sits, audio_frames the file's full length.
+    file_frames = max(audio_frames or orig_frames, audio_offset + orig_frames)
     # A hard-insert clip (see build()) adds real time to the timeline beyond the voiceover's own
     # natural length - every clip placed after one has already been shifted later to make room,
     # so the safety caps below (frames) must grow to match or those shifted clips would be
@@ -838,6 +869,7 @@ def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, hei
             cursor_source, cursor_shift = splice, cursor_shift + gap
         segments.append((cursor_source + cursor_shift, orig_frames + cursor_shift, cursor_source, orig_frames))
         track = sub(audio, "track")
+        first_segment = next((i for i, (a, b, _, _) in enumerate(segments) if a < frames and min(b, frames) > a), 0)
         for seg_index, (t_start, t_end, s_in, s_out) in enumerate(segments):
             t_end = min(t_end, frames)
             if t_start >= frames or t_end <= t_start:
@@ -845,20 +877,23 @@ def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, hei
             clip = sub(track, "clipitem", id="voiceover" if len(segments) == 1 else f"voiceover-{seg_index}")
             sub(clip, "name", "Voiceover - continuous" if len(segments) == 1 else f"Voiceover part {seg_index+1}")
             sub(clip, "enabled", "TRUE")
-            sub(clip, "duration", orig_frames)
+            sub(clip, "duration", file_frames)
             rate(clip)
-            for key, value in [("start", t_start), ("end", t_end), ("in", s_in), ("out", s_in+(t_end-t_start))]:
+            source_in = audio_offset + s_in
+            for key, value in [("start", t_start), ("end", t_end), ("in", source_in), ("out", source_in+(t_end-t_start))]:
                 sub(clip, key, value)
-            f = sub(clip, "file", id="voiceover-file" if len(segments) == 1 else f"voiceover-file-{seg_index}")
-            sub(f, "name", Path(audio_path).name)
-            sub(f, "pathurl", file_url(audio_path))
-            rate(f)
-            sub(f, "duration", orig_frames)
-            am = sub(sub(f, "media"), "audio")
-            ac = sub(am, "samplecharacteristics")
-            sub(ac, "depth", 16)
-            sub(ac, "samplerate", 48000)
-            sub(am, "channelcount", 1)
+            f = sub(clip, "file", id="voiceover-file")
+            if seg_index == first_segment:
+                # Every part is the same recording: define it once, then just refer to it.
+                sub(f, "name", Path(audio_path).name)
+                sub(f, "pathurl", file_url(audio_path))
+                rate(f)
+                sub(f, "duration", file_frames)
+                am = sub(sub(f, "media"), "audio")
+                ac = sub(am, "samplecharacteristics")
+                sub(ac, "depth", 16)
+                sub(ac, "samplerate", 48000)
+                sub(am, "channelcount", 1)
             source = sub(clip, "sourcetrack")
             sub(source, "mediatype", "audio")
             sub(source, "trackindex", 1)
@@ -906,11 +941,28 @@ def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, hei
             sub(track, "locked", "FALSE")
             sub(track, "outputchannelindex", channel)
         base_track += 2
+    for case in case_markers:
+        if case["frame"] >= frames:
+            continue
+        marker = sub(seq, "marker")
+        sub(marker, "name", case["title"])
+        sub(marker, "comment", f"Case {case['case']} starts here")
+        sub(marker, "in", case["frame"])
+        sub(marker, "out", case["frame"] + 1)
     for cue in cues:
         if cue["start"] is None:
             continue
         start = round(cue["start"] * FPS)
-        end = min(frames, max(start+1, round(cue["end"]*FPS)))
+        end = max(start+1, round(cue["end"]*FPS))
+        # Same shift build() gave the clips: everything at/after a pause-VO splice moved later. A
+        # pause clip itself sits at its own splice plus the earlier inserts, and spans its gap.
+        if "insert_shift" in cue:
+            start += cue["insert_shift"]
+            end = start + cue["insert_gap"]
+        else:
+            shift = sum(gap for splice, gap in audio_inserts if splice <= start)
+            start, end = start + shift, end + shift
+        end = min(frames, end)
         if start >= frames:
             continue
         marker = sub(seq, "marker")
@@ -978,7 +1030,9 @@ def write_report(out, report, voiceover):
         picture = '<div>' + ''.join(pictures) + '</div>' if pictures else '<div class="video">VIDEO NOT DOWNLOADED</div>'
         sources = " ".join(f'<a href="{esc(r["target"])}">{esc(r["label"])}</a>' for r in cue["refs"] if r["target"].startswith("https://"))
         status = "; ".join(cue["review"]) or "Matched; review cut by ear"
-        button = f'<button data-time="{start}">{clock(start)} → {clock(cue["end"])}</button>' if start is not None else "Unmatched"
+        # The player holds the whole recording; a case split's cues are measured from its cut.
+        button = (f'<button data-time="{start + report.get("voiceover_offset_seconds", 0)}">{clock(start)} → {clock(cue["end"])}</button>'
+                  if start is not None else "Unmatched")
         rows.append(f'<article>{picture}<div><h2>{esc(label)}</h2>{button}<p>{esc(cue["passage"])}</p><small>{esc(status)} · text match {cue["match"]:.0%}</small><p>{sources}</p></div></article>')
     warnings = "".join(f"<li>{esc(w)}</li>" for w in report["warnings"])
     page = """<!doctype html><html><head><meta charset="utf-8"><title>Skeleton review</title>
@@ -1084,6 +1138,22 @@ def _case_cut(script, narration, layout, cases, duration):
         "end_silence_seconds": None if end_silence is None else round(end_silence, 3)}
 
 
+def case_marker_times(script, narration, mapping, headings, script_from=0):
+    """Where each case begins in the voiceover: the first spoken word at or after its heading.
+    Returns [{case, title, seconds}] for headings inside the (possibly sliced) script."""
+    mapped = sorted(mapping)
+    found = []
+    for heading in headings:
+        position = heading["script_start"] - script_from
+        if position < 0 or position >= len(script):
+            continue
+        i = bisect.bisect_left(mapped, position)
+        if i < len(mapped):
+            found.append({"case": heading["number"], "title": heading["title"],
+                          "seconds": round(narration[mapping[mapped[i]]]["start"], 3)})
+    return found
+
+
 def build(docx, audio, out, words=None, width=1920, height=1080,
           download_videos=False, handles=600, full_videos=None, full_video_limit=5400,
           media_dir=None, audio_dir=None, cases=None):
@@ -1128,7 +1198,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
     import av
     with av.open(str(audio)) as container:
         duration = container.duration / av.time_base
-    case_split, cut_start = None, 0.0
+    case_split, cut_start, script_from, audio_total = None, 0.0, 0, duration
     if cases:
         # Split by case: keep only this range's stretch of the voiceover, and move every word
         # time (and so every cue) to be relative to where that stretch begins.
@@ -1147,12 +1217,14 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
             if silence is not None and silence < .2:
                 warnings.append(f"The pause at the {edge} cut is only {silence:.2f}s long; check that the audio "
                                 "really splits between two cases there.")
-    coverage = align_cues(script, cues, narration)
+    mapping = {}
+    coverage = align_cues(script, cues, narration, mapping_out=mapping)
     audio_dir.mkdir(parents=True, exist_ok=True)
     wav = audio_dir / "voiceover.wav"
     ffmpeg = ffmpeg_exe()
-    cut_args = ["-ss", f"{cut_start:.3f}", "-t", f"{duration:.3f}"] if case_split else []
-    subprocess.run([ffmpeg, "-v", "error", *cut_args, "-i", str(audio), "-ar", "48000", "-ac", "1",
+    # A case split still writes the whole recording: the sequence uses only this range's stretch of
+    # it (the clips' in-points start at the cut), so the editor can drag the ends out to restore audio.
+    subprocess.run([ffmpeg, "-v", "error", "-i", str(audio), "-ar", "48000", "-ac", "1",
                     "-c:a", "pcm_s16le", str(wav)], check=True, **NO_WINDOW)
     guide = media_dir / "visual-to-add.png"
     make_guide(guide, width, height)
@@ -1233,6 +1305,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
                                       "requested_source_start": ref["source_start"],
                                       "requested_source_end": ref["source_end"]})
                 audio_inserts.append((splice, gap))
+                cue["insert_shift"], cue["insert_gap"] = cumulative, gap
                 cumulative += gap
             clips.extend(insert_clips)
             video_edits.extend(insert_clips)
@@ -1348,6 +1421,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
               "warnings": warnings, "cues": cues, "clips": clips, "gaps": gaps,
               "unconfirmed_clips": unconfirmed_clips,
               "unused_assets": unused, "embedded_assets": embedded, "case_split": case_split,
+              "voiceover_offset_seconds": round(cut_start, 3),
               "video_assets": video_assets, "video_selects": video_selects,
               "video_options": {"enabled": download_videos, "handles_seconds": handles, "full_sources": full_videos, "full_video_limit_seconds": full_video_limit}}
     (data_dir / "manifest.json").write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -1359,10 +1433,20 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
                 continue
             writer.writerow([c["name"], round(c["start_frame"]/FPS, 3), round(c["end_frame"]/FPS, 3),
                              c["start_frame"], c["end_frame"], c["passage"], c["path"], c.get("source_url", "")])
+    # One sequence marker per case, after any pause-VO inserts have pushed the later audio along.
+    in_range = [h for h in layout["cases"] if not cases or (cases[0] <= h["number"] and (cases[1] is None or h["number"] <= cases[1]))]
+    case_markers = case_marker_times(script, narration, mapping, in_range, script_from)
+    voiceover_offset, voiceover_frames = round(cut_start * FPS), math.ceil(audio_total * FPS)
+    for marker in case_markers:
+        frame = round(marker["seconds"] * FPS)
+        marker["frame"] = frame + sum(gap for splice, gap in audio_inserts if splice <= frame)
+    report["case_markers"] = [{"case": m["case"], "title": m["title"], "seconds": round(m["frame"] / FPS, 3)} for m in case_markers]
     xml_sequence(out / "Skeleton_full.xml", "Script skeleton - full", clips, gaps, cues, wav, duration, width, height,
-                 source_audio_enabled=True, unconfirmed=unconfirmed_clips, audio_inserts=audio_inserts)
+                 source_audio_enabled=True, unconfirmed=unconfirmed_clips, audio_inserts=audio_inserts,
+                 case_markers=case_markers, audio_offset=voiceover_offset, audio_frames=voiceover_frames)
     xml_sequence(out / "Skeleton_test_45s.xml", "Script skeleton - first 45 seconds", clips, gaps, cues, wav, duration, width, height, 45,
-                 source_audio_enabled=True, unconfirmed=unconfirmed_clips, audio_inserts=audio_inserts)
+                 source_audio_enabled=True, unconfirmed=unconfirmed_clips, audio_inserts=audio_inserts,
+                 case_markers=case_markers, audio_offset=voiceover_offset, audio_frames=voiceover_frames)
     validate_xml(out / "Skeleton_full.xml")
     validate_xml(out / "Skeleton_test_45s.xml")
     if video_selects:
@@ -1399,6 +1483,9 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
         "if source sound ever competes with narration.\n"
         "Timeline/Source_Selects.xml (when present): exact full requested excerpts, source sound enabled.\n"
         "Video URLs and requested ranges are also in sequence markers. Failed downloads stay as markers.\n"
+        "Sequence markers named after each case heading ('Case 3: ...') show where that case begins.\n"
+        "When building only some cases, Audio/voiceover.wav is still the whole recording; the A1 clip\n"
+        "uses just your share of it, so drag its edges outward to bring back audio on either side.\n"
         "Main video placements start at the preceding paragraph/portion, play at normal speed, and\n"
         "are trimmed if too long for the passage. Shorter excerpts leave guide-card gaps.\n"
         "Extend video edges to use the retained handles; consult Timeline/Data/video-timings.csv and Review.html.\n"

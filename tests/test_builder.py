@@ -626,6 +626,43 @@ class CaseDetectionTests(unittest.TestCase):
             _, cues, embedded, _ = read_docx(script, root / "assets", fetch_web=False)
             self.assertNotIn("case", embedded[0])
 
+    def test_inspect_lists_each_case_with_its_heading(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            script = self._script(root, [
+                "Welcome to the video.", "Case 1: The Wiztale Incident", "Some narration here.",
+                "Case 2 - Another One", "More narration follows."])
+            listed = inspect_docx(script)["case_list"]
+            self.assertEqual([c["number"] for c in listed], [1, 2])
+            self.assertEqual(listed[0]["title"], "Case 1: The Wiztale Incident")
+            self.assertEqual(listed[1]["title"], "Case 2 - Another One")
+            plain = self._script(root, ["Just a story with no case headings."])
+            self.assertEqual(inspect_docx(plain)["case_list"], [])
+
+    def test_case_summary_counts_cues_per_case(self):
+        from skeleton_builder import _case_summary
+        layout = {"cases": [{"number": 1, "title": "Case 1: A"}, {"number": 2, "title": "Case 2: B"}]}
+        cues = [{"kind": "image", "case": 1}, {"kind": "image", "case": 1}, {"kind": "video", "case": 1},
+                {"kind": "video", "case": 2}, {"kind": "image", "case": 0}]
+        self.assertEqual(_case_summary(layout, cues), [
+            {"number": 1, "title": "Case 1: A", "image_cues": 2, "video_cues": 1},
+            {"number": 2, "title": "Case 2: B", "image_cues": 0, "video_cues": 1}])
+
+    def test_ticked_cases_become_one_contiguous_range(self):
+        from skeleton_builder import case_range_for, parse_case_range
+        every = [1, 2, 3, 4]
+        self.assertEqual(case_range_for({1, 2, 3, 4}, every), "")
+        self.assertEqual(case_range_for({3}, every), "3")
+        self.assertEqual(case_range_for({1, 3}, every), "1-3")  # the gap (case 2) is filled in
+        self.assertEqual(case_range_for({2, 4}, every), "2-4")
+        self.assertEqual(case_range_for({1, 2}, [1, 2, 4]), "1-2")
+        self.assertEqual(case_range_for({1, 4}, [1, 2, 4]), "")  # all of them, however they're numbered
+        self.assertEqual(case_range_for({2, 4}, [1, 2, 4]), "2-4")
+        for text in ("1-3", "2-4", "3"):
+            self.assertIsNotNone(parse_case_range(text))
+        with self.assertRaisesRegex(ValueError, "at least one case"):
+            case_range_for(set(), every)
+
     def test_unsynced_items_are_named_by_case_and_position(self):
         import wave
         with tempfile.TemporaryDirectory() as temp:
@@ -734,9 +771,17 @@ class CaseSplitTests(unittest.TestCase):
             self.assertLess(a["cut_end_seconds"], section_start[3])
             self.assertEqual(a["cut_start_seconds"], 0.0)
             self.assertAlmostEqual(first["duration_seconds"] + second["duration_seconds"], total, delta=0.01)
+            from skeleton_builder import FPS
             for run, report in (("A", first), ("B", second)):
-                self.assertAlmostEqual(self._wav_seconds(root / run / "Audio" / "voiceover.wav"),
-                                       report["duration_seconds"], delta=0.05)
+                # Each editor's file holds the whole recording (so its ends can be dragged out to
+                # restore audio); the sequence uses only their stretch of it.
+                self.assertAlmostEqual(self._wav_seconds(root / run / "Audio" / "voiceover.wav"), total, delta=0.05)
+                xml = ET.parse(str(root / run / "Timeline" / "Skeleton_full.xml"))
+                voice = xml.find("sequence/media/audio/track[1]/clipitem")
+                self.assertEqual(int(voice.findtext("in")), round(report["case_split"]["cut_start_seconds"] * FPS))
+                self.assertAlmostEqual((int(voice.findtext("out")) - int(voice.findtext("in"))) / FPS,
+                                       report["duration_seconds"], delta=0.1)
+                self.assertGreaterEqual(int(voice.findtext("duration")), round(total * FPS))
             # Each editor only gets their own media: one linked picture and one loose picture per case.
             self.assertEqual(len(first["embedded_assets"]), 3)
             self.assertEqual(len(second["embedded_assets"]), 3)
@@ -753,6 +798,38 @@ class CaseSplitTests(unittest.TestCase):
 
     def test_split_also_works_when_the_vo_reads_the_case_headings_aloud(self):
         self._check_split(speak_headings=True)
+
+    def _case_markers_in(self, xml_path):
+        from skeleton_builder import FPS
+        markers = ET.parse(str(xml_path)).getroot().findall("./sequence/marker")
+        return [(m.findtext("name"), int(m.findtext("in")) / FPS) for m in markers if m.findtext("name").startswith("Case ")]
+
+    def test_timeline_carries_a_marker_where_each_case_begins(self):
+        for speak_headings in (False, True):
+            with tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                audio, total, sentence_start, section_start = self._make(root, speak_headings)
+                script = root / "script.docx"
+                whole = build(script, audio, root / "W" / "Timeline", words=root / "words.json")
+                # The marker sits on the first thing said in the case: its spoken heading if the VO
+                # reads them out, otherwise its first sentence.
+                begins = section_start if speak_headings else sentence_start
+                self.assertEqual([m["case"] for m in whole["case_markers"]], [1, 2, 3, 4])
+                for marker in whole["case_markers"]:
+                    self.assertAlmostEqual(marker["seconds"], begins[marker["case"]], delta=.05)
+                for xml in ("Skeleton_full.xml", "Skeleton_test_45s.xml"):
+                    found = self._case_markers_in(root / "W" / "Timeline" / xml)
+                    limit = 45 if "45s" in xml else total
+                    expected = [(c[0], begins[n]) for n, c in enumerate(self.CASES, 1) if begins[n] < limit]
+                    self.assertEqual([name for name, _ in found], [name for name, _ in expected])
+                    for (_, seen), (_, wanted) in zip(found, expected):
+                        self.assertAlmostEqual(seen, wanted, delta=.05)
+                # An editor's slice only carries its own cases, measured from where its audio starts.
+                second = build(script, audio, root / "B" / "Timeline", words=root / "words.json", cases=(3, 4))
+                cut = second["case_split"]["cut_start_seconds"]
+                self.assertEqual([m["case"] for m in second["case_markers"]], [3, 4])
+                for marker in second["case_markers"]:
+                    self.assertAlmostEqual(marker["seconds"], begins[marker["case"]] - cut, delta=.05)
 
     def test_last_range_runs_to_the_end_and_first_range_holds_the_intro(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -946,6 +1023,136 @@ class XmlTests(unittest.TestCase):
             self.assertEqual(clip.findtext("name"), "Voiceover - continuous")
             self.assertEqual(clip.findtext("start"), "0")
             self.assertEqual(clip.findtext("end"), str(600))
+
+
+class PauseInsertTimelineTests(unittest.TestCase):
+    """A pause-VO clip pushes everything after it later: audio parts, clips and markers alike."""
+    LINES = ["Case 1 Start", "Officers arrived and searched the whole quiet house.",
+             "Case 2 Next", "Later the detectives returned to interview every single neighbour again.",
+             "What they found upstairs changed everything for them.",
+             "Case 3 Last", "Finally the whole matter was closed for good."]
+
+    def _make(self, root):
+        import wave
+        Image.new("RGB", (60, 40)).save(root / "img.png")
+        w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        doc = (f'<w:document xmlns:w="{w}" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+               'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body>'
+               '<w:p><w:r><w:t>Case 1: Start</w:t></w:r></w:p>'
+               f'<w:p><w:r><w:t>{self.LINES[1]}</w:t></w:r></w:p>'
+               '<w:p><w:r><w:t>Case 2: Next</w:t></w:r></w:p>'
+               f'<w:p><w:r><w:t>{self.LINES[3]}</w:t></w:r></w:p>'
+               '<w:p><w:hyperlink r:id="h1"><w:r><w:t>[ 2:07 - 2:10 ]</w:t></w:r></w:hyperlink></w:p>'
+               f'<w:p><w:r><w:t>What they found upstairs changed everything for them</w:t></w:r><w:r><w:t xml:space="preserve"> (</w:t></w:r>'
+               '<w:hyperlink w:anchor="b1"><w:r><w:t>IMG 1</w:t></w:r></w:hyperlink><w:r><w:t>).</w:t></w:r></w:p>'
+               '<w:p><w:r><w:t>Case 3: Last</w:t></w:r></w:p>'
+               f'<w:p><w:r><w:t>{self.LINES[6]}</w:t></w:r></w:p>'
+               '<w:bookmarkStart w:id="1" w:name="b1"/><w:p><a:blip r:embed="a1"/></w:p></w:body></w:document>')
+        with ZipFile(root / "script.docx", "w") as z:
+            z.writestr("word/document.xml", doc)
+            z.writestr("word/_rels/document.xml.rels",
+                       '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                       '<Relationship Id="h1" Target="https://youtu.be/fftGair1ZoA"/>'
+                       '<Relationship Id="a1" Target="media/image1.png"/></Relationships>')
+            z.write(root / "img.png", "word/media/image1.png")
+        spoken, t, begins = [], 0.0, []
+        for n, line in enumerate(self.LINES):
+            t += 1.5
+            begins.append(t)
+            for word in line.split():
+                spoken.append({"word": word.strip(".").lower(), "start": round(t, 3), "end": round(t + .4, 3)})
+                t += .5
+            if n == 3:
+                t += 4.0  # where the pause clip goes
+        total = t + 3
+        audio = root / "vo.wav"
+        with wave.open(str(audio), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(bytes(2) * int(16000 * total))
+        (root / "words.json").write_text(json.dumps({
+            "audio_sha256": hashlib.sha256(audio.read_bytes()).hexdigest(), "words": spoken}))
+        (root / "clip.mp4").write_bytes(b"fake")
+        return audio, total, begins
+
+    def _build(self, root, out, cases=None):
+        from unittest import mock
+
+        def prepare(cues, *args, **kwargs):
+            for cue in cues:
+                if cue["kind"] == "video":
+                    for ref in cue["refs"]:
+                        ref["video_asset"] = {"path": str(root / "clip.mp4"), "width": 640, "height": 360,
+                                              "kind": "video", "has_audio": False,
+                                              "source_duration_frames": 2000, "title": "fake"}
+                        ref.update(in_frame=100, out_frame=190, source_start=2.0, source_end=5.0)
+            return [], []
+
+        audio, total, begins = self._make(root)
+        with mock.patch("youtube_media.prepare_sources", prepare):
+            report = build(root / "script.docx", audio, root / out / "Timeline", words=root / "words.json",
+                           download_videos=True, cases=cases)
+        return report, ET.parse(str(root / out / "Timeline" / "Skeleton_full.xml")), total, begins
+
+    def _check(self, xml, report, offset_frames):
+        from skeleton_builder import FPS
+        seq = xml.find("sequence")
+        parts = seq.findall("media/audio/track[1]/clipitem")
+        self.assertEqual(len(parts), 2)
+        insert = next(c for c in seq.findall("media/video/track/clipitem") if c.findtext("name").startswith("INSERT"))
+        gap = int(insert.findtext("end")) - int(insert.findtext("start"))
+        self.assertGreater(gap, 0)
+        # The VO stops where the pause clip starts, resumes where it ends, and picks up the
+        # recording exactly where it left off.
+        self.assertEqual(int(parts[0].findtext("end")), int(insert.findtext("start")))
+        self.assertEqual(int(parts[1].findtext("start")), int(insert.findtext("end")))
+        self.assertEqual(int(parts[1].findtext("in")), int(parts[0].findtext("out")))
+        self.assertEqual(int(parts[0].findtext("in")), offset_frames)
+        # One recording, defined once and then referred to.
+        files = seq.findall("media/audio/track[1]//file")
+        self.assertEqual({f.get("id") for f in files}, {"voiceover-file"})
+        self.assertEqual([len(f) > 0 for f in files], [True, False])
+        # Every marker sits on the thing it names, after the shift.
+        markers = {m.findtext("name"): m for m in seq.findall("marker")}
+        image = next(c for c in seq.findall("media/video/track/clipitem") if c.findtext("name") == "IMG 1")
+        self.assertEqual(markers["IMAGE | IMG 1"].findtext("in"), image.findtext("start"))
+        video = next(m for n, m in markers.items() if n.startswith("VIDEO"))
+        self.assertEqual(video.findtext("in"), insert.findtext("start"))
+        self.assertEqual(int(video.findtext("out")) - int(video.findtext("in")), gap)
+        return markers, gap, FPS
+
+    def test_pause_clip_shifts_audio_parts_clips_and_markers_together(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            report, xml, total, begins = self._build(root, "W")
+            markers, gap, fps = self._check(xml, report, 0)
+            # Cases 1 and 2 are announced before the pause, so they stay put; case 3 comes after it
+            # and moves later by exactly the pause clip's length.
+            self.assertAlmostEqual(int(markers["Case 1: Start"].findtext("in")) / fps, begins[0], delta=.05)
+            self.assertAlmostEqual(int(markers["Case 2: Next"].findtext("in")) / fps, begins[2], delta=.05)
+            self.assertAlmostEqual(int(markers["Case 3: Last"].findtext("in")) / fps, begins[5] + gap / fps, delta=.05)
+
+    def test_split_build_keeps_the_whole_recording_so_the_ends_can_be_restored(self):
+        import wave
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            report, xml, total, begins = self._build(root, "B", cases=(2, None))
+            cut = report["case_split"]["cut_start_seconds"]
+            self.assertGreater(cut, 0)
+            from skeleton_builder import FPS
+            self._check(xml, report, round(cut * FPS))
+            with wave.open(str(root / "B" / "Audio" / "voiceover.wav")) as wav:
+                self.assertAlmostEqual(wav.getnframes() / wav.getframerate(), total, delta=.05)
+            part = xml.find("sequence/media/audio/track[1]/clipitem")
+            self.assertGreaterEqual(int(part.findtext("duration")), round(total * FPS))
+            self.assertEqual(report["voiceover_offset_seconds"], cut)
+            # The timeline itself is only this range's stretch, plus the pause clip.
+            self.assertLess(int(xml.findtext("sequence/duration")), round(total * FPS))
+            # ...and the review page's player seeks into the whole recording from that cut.
+            page = (root / "B" / "Review.html").read_text(encoding="utf-8")
+            first = next(c for c in report["cues"] if c["start"] is not None)
+            self.assertIn(f'data-time="{first["start"] + cut}"', page)
 
 
 if __name__ == "__main__":
