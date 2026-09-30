@@ -26,6 +26,7 @@ from skeleton_builder import case_range_for, inspect_docx, preview_cues
 from google_docs import is_google_doc_url, download_google_doc, missing_tab_warning
 from drive_audio import is_drive_url
 from paths import FROZEN
+from system_clipboard import copy_text
 import updater
 
 PRESETS = {
@@ -790,8 +791,15 @@ def main(smoke_test: bool = False):
         if not xml:
             messagebox.showwarning("Not ready", "This run has no Skeleton_full.xml yet.")
             return
-        window.clipboard_clear()
-        window.clipboard_append(str(xml))
+        # The system clipboard, written immediately and read back - Tk's own clipboard hands the
+        # text over lazily, so it can arrive empty if this window is busy when Premiere asks.
+        def copy_path():
+            def tk_copy(text):
+                window.clipboard_clear()
+                window.clipboard_append(text)
+            return copy_text(str(xml), fallback=tk_copy)
+
+        copied = copy_path()
         program = settings_vars["premiere_exe"].get().strip() or find_premiere()
         opened = False
         if program:
@@ -803,15 +811,39 @@ def main(smoke_test: bool = False):
                 opened = True
             except Exception:
                 opened = False
-        messagebox.showinfo(
-            "Copy Skeleton Path",
-            ("Premiere Pro is opening. " if opened else "Couldn't launch Premiere Pro automatically — "
-             "open it yourself, or set its location in Paths & Options. ") +
-            "Premiere has no way to import an XML automatically from outside the app, so finish it "
-            "manually:\n\n"
-            "1. In Premiere, press Ctrl+I (Cmd+I on Mac), or File > Import.\n"
-            "2. Paste the path (already on your clipboard) into the filename box and press Enter.\n\n"
-            f"Path: {xml}")
+        show_copy_result(str(xml), opened, copied, copy_path)
+
+    def show_copy_result(xml, opened, copied, copy_path):
+        top = tk.Toplevel(window)
+        top.title("Copy Skeleton Path")
+        top.configure(bg=BG, padx=16, pady=14)
+        top.transient(window)
+        top.resizable(False, False)
+        state = tk.StringVar()
+
+        def set_state(ok):
+            state.set("✓ The path is on your clipboard." if ok else
+                      "⚠ Couldn't confirm the path was copied. Select it below and copy it (Ctrl+C / Cmd+C), "
+                      "or press Copy again.")
+
+        set_state(copied)
+        ttk.Label(top, text=("Premiere Pro is opening. " if opened else "Couldn't launch Premiere Pro automatically — "
+                             "open it yourself, or set its location in Paths & Options. ") +
+                  "Premiere has no way to import an XML automatically from outside the app, so finish it "
+                  "manually:\n\n1. In Premiere, press Ctrl+I (Cmd+I on Mac), or File > Import.\n"
+                  "2. Paste the path into the filename box and press Enter.",
+                  wraplength=560, justify="left").pack(anchor="w")
+        ttk.Label(top, textvariable=state, wraplength=560, justify="left").pack(anchor="w", pady=(10, 4))
+        path_box = ttk.Entry(top, width=80)
+        path_box.insert(0, xml)
+        path_box.configure(state="readonly")
+        path_box.pack(fill="x")
+        row = ttk.Frame(top)
+        row.pack(anchor="e", pady=(12, 0))
+        ttk.Button(row, text="Copy again", command=lambda: set_state(copy_path())).pack(side="left")
+        ttk.Button(row, text="OK", command=top.destroy).pack(side="left", padx=(8, 0))
+        top.grab_set()
+        top.wait_window()
 
     def open_project():
         run = chosen_run()
