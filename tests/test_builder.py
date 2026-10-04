@@ -685,11 +685,9 @@ class CaseDetectionTests(unittest.TestCase):
                 {"word": w, "start": i * 0.5, "end": i * 0.5 + 0.4} for i, w in enumerate(spoken)]}))
             report = build(script, audio, root / "Project" / "Timeline", words=root / "words.json")
             names = [c["name"] for c in sorted(report["unconfirmed_clips"], key=lambda c: c["start_frame"])]
-            self.assertEqual(names, ["INTRO_1", "CASE 1_1", "CASE 2_1", "CASE 2_2", "CASE 3_1"])
-            self.assertTrue(all(c["original_name"].startswith("UNSYNCED")
-                                for c in report["unconfirmed_clips"]))
+            self.assertEqual(names, ["UNSYNCED IMG_INTRO_1", "UNSYNCED IMG_1_1", "UNSYNCED IMG_2_1", "UNSYNCED IMG_2_2", "UNSYNCED IMG_3_1"])
             xml = (root / "Project" / "Timeline" / "Skeleton_full.xml").read_text(encoding="utf8")
-            self.assertIn("CASE 2_2", xml)
+            self.assertIn("UNSYNCED IMG_2_2", xml)
 
 
 class CaseSplitTests(unittest.TestCase):
@@ -791,7 +789,7 @@ class CaseSplitTests(unittest.TestCase):
             self.assertEqual([c["case"] for c in second["cues"]], [3])
             # Case 3's cue lands where its sentence starts, measured from the cut, not from 0:00.
             self.assertAlmostEqual(second["cues"][0]["start"], sentence_start[3] - b["cut_start_seconds"], delta=0.05)
-            self.assertTrue(all(c["name"].startswith(("CASE 3_", "CASE 4_")) for c in second["unconfirmed_clips"]))
+            self.assertTrue(all(c["name"].startswith(("UNSYNCED IMG_3_", "UNSYNCED IMG_4_")) for c in second["unconfirmed_clips"]))
 
     def test_two_editors_split_the_voiceover_between_their_cases(self):
         self._check_split(speak_headings=False)
@@ -916,14 +914,13 @@ class UnconfirmedTrackTests(unittest.TestCase):
 
             confirmed = [c for c in report["clips"] if c.get("kind") != "video"]
             self.assertEqual(len(confirmed), 1)
-            self.assertTrue(confirmed[0]["name"].startswith("IMG 1"))
+            self.assertEqual(confirmed[0]["name"], "IMG_1")
 
             unconfirmed = sorted(report["unconfirmed_clips"], key=lambda c: c["start_frame"])
             self.assertEqual(len(unconfirmed), 2)
             # Script order preserved: the orphan bookmark sits between paragraph 1's image
             # and paragraph 2 in the document, so it must be placed first on the unsynced track.
-            self.assertFalse(unconfirmed[0]["name"].startswith("UNSYNCED IMG 2"))
-            self.assertTrue(unconfirmed[1]["name"].startswith("UNSYNCED IMG 2"))
+            self.assertEqual([c["name"] for c in unconfirmed], ["UNSYNCED IMG_2", "UNSYNCED IMG_3"])
             for clip in unconfirmed:
                 self.assertGreaterEqual(clip["start_frame"], confirmed[0]["end_frame"])
             for a, b in zip(unconfirmed, unconfirmed[1:]):
@@ -1091,7 +1088,7 @@ class PartialVoiceoverTests(unittest.TestCase):
             split = report["case_split"]
             self.assertEqual(split["cut_start_seconds"], 0.0)
             self.assertAlmostEqual(split["cut_end_seconds"], total, delta=.01)  # nothing to cut: the VO is these cases
-            self.assertEqual([c["name"] for c in report["clips"]], ["IMG 3", "IMG 4"])
+            self.assertEqual([c["name"] for c in report["clips"]], ["IMG_3_1", "IMG_4_1"])
             self.assertEqual([m["case"] for m in report["case_markers"]], [3, 4])
             self.assertAlmostEqual(report["case_markers"][0]["seconds"], starts[3], delta=.05)
 
@@ -1102,7 +1099,7 @@ class PartialVoiceoverTests(unittest.TestCase):
             self.assertEqual(split["cut_start_seconds"], 0.0)
             self.assertGreater(split["cut_end_seconds"], starts[4] - 2.0)  # inside the pause before case 4
             self.assertLess(split["cut_end_seconds"], starts[4])
-            self.assertEqual([c["name"] for c in report["clips"]], ["IMG 3"])
+            self.assertEqual([c["name"] for c in report["clips"]], ["IMG_3_1"])
 
     def test_ticking_cases_the_voiceover_lacks_is_a_clear_error(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1114,6 +1111,18 @@ class PartialVoiceoverTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "seems to contain only cases 3-4; tick just those"):
                 self._build(Path(temp), range(1, 7), (3, 4))
 
+    def test_a_media_folder_with_a_restricted_character_is_warned_about(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            audio, _, _ = self._make(root, (3, 4), (3, 4))
+            for folder, warned in (("Q&A", True), ("Plain", False)):
+                report = build(root / "script.docx", audio, root / folder / "Timeline", words=root / "words.json",
+                               media_dir=root / folder / "Media")
+                found = [w for w in report["warnings"] if "Premiere may refuse to open" in w]
+                self.assertEqual(bool(found), warned, folder)
+                if warned:
+                    self.assertIn("&", found[0])
+
     def test_voiceover_longer_than_the_script_is_trimmed_to_the_scripts_cases(self):
         for cases in (None, (3, 4)):
             with tempfile.TemporaryDirectory() as temp:
@@ -1124,7 +1133,7 @@ class PartialVoiceoverTests(unittest.TestCase):
                 self.assertLess(split["cut_start_seconds"], starts[3])
                 self.assertAlmostEqual(split["cut_end_seconds"], total, delta=.01)
                 self.assertLess(report["duration_seconds"], total - starts[3] + 2.0 + .01)
-                self.assertEqual([c["name"] for c in report["clips"]], ["IMG 3", "IMG 4"])
+                self.assertEqual([c["name"] for c in report["clips"]], ["IMG_3_1", "IMG_4_1"])
                 self.assertAlmostEqual(report["case_markers"][0]["seconds"], starts[3] - split["cut_start_seconds"], delta=.05)
                 self.assertEqual(report["voiceover_offset_seconds"], split["cut_start_seconds"])
 
@@ -1224,7 +1233,7 @@ class PauseInsertTimelineTests(unittest.TestCase):
         seq = xml.find("sequence")
         parts = seq.findall("media/audio/track[1]/clipitem")
         self.assertEqual(len(parts), 2)
-        insert = next(c for c in seq.findall("media/video/track/clipitem") if c.findtext("name").startswith("INSERT"))
+        insert = next(c for c in seq.findall("media/video/track/clipitem") if "| INSERT" in c.findtext("name"))
         gap = int(insert.findtext("end")) - int(insert.findtext("start"))
         self.assertGreater(gap, 0)
         # The VO stops where the pause clip starts, resumes where it ends, and picks up the
@@ -1239,9 +1248,9 @@ class PauseInsertTimelineTests(unittest.TestCase):
         self.assertEqual([len(f) > 0 for f in files], [True, False])
         # Every marker sits on the thing it names, after the shift.
         markers = {m.findtext("name"): m for m in seq.findall("marker")}
-        image = next(c for c in seq.findall("media/video/track/clipitem") if c.findtext("name") == "IMG 1")
-        self.assertEqual(markers["IMAGE | IMG 1"].findtext("in"), image.findtext("start"))
-        video = next(m for n, m in markers.items() if n.startswith("VIDEO"))
+        image = next(c for c in seq.findall("media/video/track/clipitem") if c.findtext("name").startswith("IMG_"))
+        self.assertEqual(markers[image.findtext("name")].findtext("in"), image.findtext("start"))
+        video = next(m for n, m in markers.items() if n.startswith("VID_"))
         self.assertEqual(video.findtext("in"), insert.findtext("start"))
         self.assertEqual(int(video.findtext("out")) - int(video.findtext("in")), gap)
         return markers, gap, FPS

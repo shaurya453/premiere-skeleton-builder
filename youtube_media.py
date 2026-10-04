@@ -323,7 +323,7 @@ def place_video_clips(cues, images, sequence_frames):
                 continue
             source_in, source_out = ref["in_frame"], ref["out_frame"]
             length = source_out-source_in
-            base = {**asset, "name": f"VIDEO {ref['label']} | {asset['title']}",
+            base = {**asset, "name": f"{Path(asset['path']).stem} | {ref['label']} | {asset['title']}",
                     "in_frame": source_in, "source_url": ref["target"], "passage": cue["passage"],
                     "doc_order": cue.get("doc_order", 0),
                     "requested_source_start": ref["source_start"], "requested_source_end": ref["source_end"],

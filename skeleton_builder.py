@@ -27,6 +27,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from google_docs import is_google_doc_url, download_google_doc
 from paths import NO_WINDOW, cache_dir, ffmpeg_exe, local_cache_dir, temp_dir
+from media_names import media_stem, rename_media
 from safe_names import restricted_characters
 
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
@@ -967,11 +968,7 @@ def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, hei
         if start >= frames:
             continue
         marker = sub(seq, "marker")
-        label = " / ".join(r["label"] for r in cue["refs"])
-        prefix = "IMAGE | "
-        if cue["kind"] == "video":
-            prefix = "VIDEO | " if all(r.get("video_asset") for r in cue["refs"]) else "VIDEO NEEDED | "
-        sub(marker, "name", prefix + label)
+        sub(marker, "name", " / ".join(_marker_name(r, cue["kind"]) for r in cue["refs"]))
         comment = cue["passage"] + "\n" + "\n".join(r["target"] for r in cue["refs"])
         if cue["review"]:
             comment += "\nREVIEW: " + "; ".join(cue["review"])
@@ -980,6 +977,17 @@ def xml_sequence(path, name, clips, gaps, cues, audio_path, duration, width, hei
         sub(marker, "out", end)
     ET.ElementTree(root).write(str(path), xml_declaration=True, encoding="UTF-8",
                               pretty_print=True, doctype="<!DOCTYPE xmeml>")
+
+
+def _marker_name(ref, kind):
+    """The marker names the file the clip uses (IMG_5_1, VID_5_1 | 0:03 - 0:10), or says it is missing."""
+    asset = ref.get("video_asset") if kind == "video" else ref.get("asset")
+    if not asset or not asset.get("path"):
+        return ("VIDEO NEEDED | " if kind == "video" else "IMAGE NEEDED | ") + ref["label"]
+    stem = Path(asset["path"]).stem
+    if kind != "video":
+        return stem
+    return ref["label"] if ref["label"].startswith(stem) else f"{stem} | {ref['label']}"
 
 
 def make_guide(path, width, height):
@@ -1278,6 +1286,16 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
     if risky:
         warnings.append(f"The folder path contains {' '.join(sorted(set(risky)))}; Premiere may refuse to open the "
                         f"XML. Move the project or media folder to a path without those characters: {media_dir}")
+    # Uniform names for the pictures (IMG_<case>_<n>, script order) before any clip is made from them.
+    pictures = [(ref["asset"], cue.get("case"), cue.get("doc_order", 0))
+                for cue in cues for ref in cue["refs"]
+                if ref.get("asset") and ref["asset"].get("path")]
+    pictures += [(asset, asset.get("case"), asset.get("doc_order", 0)) for asset in embedded]
+    rename_media([(asset, case) for asset, case, _ in sorted(pictures, key=lambda p: p[2])], "IMG")
+    # Anything still carrying a download name was fetched for a link no cue ended up using (a YouTube
+    # link's thumbnail, say): it would sit in Media/Images unnamed and unused, so it goes.
+    for leftover in (media_dir / "Images").glob("web_*"):
+        leftover.unlink(missing_ok=True)
     narration, method, timing_warnings = timed_tokens(words, audio)
     warnings.extend(timing_warnings)
     import av
@@ -1357,7 +1375,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
             if end <= start:
                 warnings.append(f"Skipped zero-length cue {ref['label']}")
                 continue
-            label = ref["label"] if "IMG" in ref["label"].upper() else "IMG " + ref["label"]
+            label = Path(asset["path"]).stem
             clips.append({**asset, "name": label, "start_frame": start, "end_frame": end,
                           "passage": cue["passage"], "source_url": ref["target"], "doc_order": cue.get("doc_order", 0)})
             used.add(asset["path"])
@@ -1370,6 +1388,9 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
         from youtube_media import prepare_sources, place_video_clips
         video_assets, failures = prepare_sources(cues, media_dir / "Videos", handles, full_videos, full_limit=full_video_limit)
         warnings.extend(failures)
+        rename_media([(ref["video_asset"], cue.get("case"))
+                      for cue in sorted(cues, key=lambda c: c.get("doc_order", 0)) if cue["kind"] == "video"
+                      for ref in cue["refs"] if ref.get("video_asset")], "VID")
         video_edits, video_selects = place_video_clips(cues, clips, frames)
         clips.extend(video_edits)
         for cue in cues:
@@ -1405,7 +1426,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
                 asset = ref["video_asset"]
                 start = splice + cumulative
                 end = start + gap
-                insert_clips.append({**asset, "name": f"INSERT {ref['label']} | {asset['title']}",
+                insert_clips.append({**asset, "name": f"{Path(asset['path']).stem} | INSERT {ref['label']} | {asset['title']}",
                                       "start_frame": start, "end_frame": end, "in_frame": ref["in_frame"],
                                       "passage": cue["passage"], "source_url": ref["target"],
                                       "doc_order": cue.get("doc_order", 0),
@@ -1434,8 +1455,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
     unconfirmed_items = []
     for cue, ref in unconfirmed_image_refs:
         asset = ref["asset"]
-        label = ref["label"] if "IMG" in ref["label"].upper() else "IMG " + ref["label"]
-        unconfirmed_items.append({**asset, "name": "UNSYNCED " + label, "passage": cue["passage"],
+        unconfirmed_items.append({**asset, "name": "UNSYNCED " + Path(asset["path"]).stem, "passage": cue["passage"],
                                   "source_url": ref["target"], "doc_order": cue.get("doc_order", 0),
                                   "case": cue.get("case", asset.get("case")),
                                   "duration_frames": round(3 * FPS)})
@@ -1443,7 +1463,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
     for cue, ref in unconfirmed_video_refs:
         asset = ref["video_asset"]
         length = max(1, ref["out_frame"] - ref["in_frame"])
-        unconfirmed_items.append({**asset, "name": f"UNSYNCED VIDEO {ref['label']} | {asset['title']}",
+        unconfirmed_items.append({**asset, "name": f"UNSYNCED {Path(asset['path']).stem} | {ref['label']} | {asset['title']}",
                                   "in_frame": ref["in_frame"], "passage": cue["passage"],
                                   "source_url": ref["target"], "doc_order": cue.get("doc_order", 0),
                                   "case": cue.get("case"), "duration_frames": length})
@@ -1493,26 +1513,31 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
         resolved_unconfirmed.append({**clip, "start_frame": start, "end_frame": end})
         cursor = end
     unconfirmed_clips = resolved_unconfirmed
-    # Name each V3 item after the case it belongs to and its position among that case's V3
-    # items, in script order: "CASE 3_2" (or "INTRO_1" before the first case). The descriptive
-    # name it had is kept as `original_name`. Items with no case (a script without case
-    # dividers, or a picture from a header/footer) keep their UNSYNCED names.
-    position = {}
-    for clip in sorted(unconfirmed_clips, key=lambda c: (c["doc_order"], c["start_frame"])):
-        case = clip.get("case")
-        if case is None:
-            continue
-        position[case] = position.get(case, 0) + 1
-        clip["original_name"] = clip["name"]
-        clip["name"] = f"{'INTRO' if case == 0 else f'CASE {case}'}_{position[case]}"
     if unconfirmed_clips:
         warnings.append(f"{len(unconfirmed_clips)} item(s) could not be confidently timed against "
                          "the narration; placed on the unsynced track (V3) in script order for manual repositioning.")
 
-    gaps, cursor = [], 0
+    # One sequence marker per case, after any pause-VO inserts have pushed the later audio along.
+    in_range = [h for h in layout["cases"] if not cases or (cases[0] <= h["number"] and (cases[1] is None or h["number"] <= cases[1]))]
+    # Anchored matches only: a stray match of a heading's words must not place a case marker.
+    case_markers = case_marker_times(script, narration, _anchored_mapping(script, narration)[1], in_range, script_from)
+    voiceover_offset, voiceover_frames = round(cut_start * FPS), math.ceil(audio_total * FPS)
+    for marker in case_markers:
+        frame = round(marker["seconds"] * FPS)
+        marker["frame"] = frame + sum(gap for splice, gap in audio_inserts if splice <= frame)
+    case_starts = sorted(case_markers, key=lambda m: m["frame"])
+
+    def case_at_frame(frame):
+        if not case_starts:
+            return None
+        return next((m["case"] for m in reversed(case_starts) if m["frame"] <= frame), 0)  # 0: before the first case
+    gaps, cursor, guide_count = [], 0, {}
     for clip in sorted(clips + unconfirmed_clips, key=lambda c: c["start_frame"]) + [{"start_frame": frames, "end_frame": frames}]:
         if cursor < clip["start_frame"]:
-            gaps.append({"name": "GUIDE - visual to add", "path": str(guide), "width": width, "height": height,
+            case = case_at_frame(cursor)
+            guide_count[case] = guide_count.get(case, 0) + 1
+            gaps.append({"name": f"{media_stem('GUIDE', case, guide_count[case])} - visual to add",
+                         "path": str(guide), "width": width, "height": height,
                          "start_frame": cursor, "end_frame": clip["start_frame"]})
         cursor = max(cursor, clip["end_frame"])
     if any(c["start"] is None for c in cues):
@@ -1540,14 +1565,6 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
                 continue
             writer.writerow([c["name"], round(c["start_frame"]/FPS, 3), round(c["end_frame"]/FPS, 3),
                              c["start_frame"], c["end_frame"], c["passage"], c["path"], c.get("source_url", "")])
-    # One sequence marker per case, after any pause-VO inserts have pushed the later audio along.
-    in_range = [h for h in layout["cases"] if not cases or (cases[0] <= h["number"] and (cases[1] is None or h["number"] <= cases[1]))]
-    # Anchored matches only: a stray match of a heading's words must not place a case marker.
-    case_markers = case_marker_times(script, narration, _anchored_mapping(script, narration)[1], in_range, script_from)
-    voiceover_offset, voiceover_frames = round(cut_start * FPS), math.ceil(audio_total * FPS)
-    for marker in case_markers:
-        frame = round(marker["seconds"] * FPS)
-        marker["frame"] = frame + sum(gap for splice, gap in audio_inserts if splice <= frame)
     report["case_markers"] = [{"case": m["case"], "title": m["title"], "seconds": round(m["frame"] / FPS, 3)} for m in case_markers]
     xml_sequence(out / "Skeleton_full.xml", "Script skeleton - full", clips, gaps, cues, wav, duration, width, height,
                  source_audio_enabled=True, unconfirmed=unconfirmed_clips, audio_inserts=audio_inserts,
@@ -1583,10 +1600,11 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
         "3. Import Timeline/Skeleton_full.xml for the complete sequence.\n\n"
         "V2: editable images and prepared videos, timed against the narration. V3: media the\n"
         "pipeline downloaded/extracted but could not confidently time against the narration\n"
-        "(named CASE 3_2 = second such item in case 3; INTRO_1 before the first case; 'UNSYNCED ...'\n"
-        "if the script has no case headings) - reposition these by hand; they are already the right\n"
-        "file, just not yet at the right timestamp. V1: guide cards in any gap that still has no\n"
+        "(named UNSYNCED IMG_3_2 = the second picture of case 3; IMG_INTRO_1 before the first case) -\n"
+        "reposition these by hand; they are already the right file, just not yet at the right\n"
+        "timestamp. V1: guide cards (GUIDE_3_1 = the first one in case 3) in any gap that still has no\n"
         "visual reference at all, or where a download genuinely failed (see warnings). A1: narration.\n"
+        "Every file is named like its clip: Media/Images/IMG_<case>_<n>, Media/Videos/VID_<case>_<n>.\n"
         "A2/A3: linked source-video sound, enabled by default. Mute those clips in Premiere\n"
         "if source sound ever competes with narration.\n"
         "Timeline/Source_Selects.xml (when present): exact full requested excerpts, source sound enabled.\n"
