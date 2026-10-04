@@ -1025,6 +1025,130 @@ class XmlTests(unittest.TestCase):
             self.assertEqual(clip.findtext("end"), str(600))
 
 
+class PartialVoiceoverTests(unittest.TestCase):
+    """The script and the voiceover don't have to cover the same cases."""
+    SENTENCES = {
+        1: "Sunlight warmed the quiet misty valley slowly across the morning while small birds sang softly above",
+        2: "Lanterns glowed along the empty harbor road as weary fishermen coiled their heavy wet ropes before dawn",
+        3: "The river ran cold under gray winter skies while patient villagers waited anxiously for the spring rain",
+        4: "Copper kettles rattled on the crowded market stalls beneath striped canvas awnings during the busy noon",
+        5: "Ancient clocks chimed across the silent monastery courtyard as pale monks carried lanterns toward the chapel",
+        6: "Frozen lakes cracked loudly under the heavy northern moon while distant wolves howled across the endless pines",
+    }
+
+    def _make(self, root, script_cases, vo_cases, lead=0):
+        import re
+        import wave
+        Image.new("RGB", (60, 40)).save(root / "img.png")
+        body, rels, files = "", "", []
+        for n in script_cases:
+            # "The valley" also occurs in case 1's narration: a heading whose words match a stray spot in
+            # a voiceover that has other cases is the realistic trap for locating where the script starts.
+            body += (f"<w:p><w:r><w:t>Case {n}: The valley</w:t></w:r></w:p>"
+                     f'<w:p><w:r><w:t>{self.SENTENCES[n]}.</w:t></w:r><w:r><w:t xml:space="preserve"> (</w:t></w:r>'
+                     f'<w:hyperlink w:anchor="b{n}"><w:r><w:t>IMG {n}</w:t></w:r></w:hyperlink><w:r><w:t>)</w:t></w:r></w:p>'
+                     f'<w:bookmarkStart w:id="{n}" w:name="b{n}"/><w:p><a:blip r:embed="a{n}"/></w:p>')
+            rels += f'<Relationship Id="a{n}" Target="media/image{n}.png"/>'
+            files.append(f"word/media/image{n}.png")
+        doc = ('<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+               'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+               'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><w:body>' + body + "</w:body></w:document>")
+        with ZipFile(root / "script.docx", "w") as z:
+            z.writestr("word/document.xml", doc)
+            z.writestr("word/_rels/document.xml.rels",
+                       '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + rels + "</Relationships>")
+            for name in files:
+                z.write(root / "img.png", name)
+        spoken, t, starts = [], 0.0, {}
+        for word in ("so", "welcome", "back", "to", "the", "show", "everyone")[:lead]:
+            spoken.append({"word": word, "start": round(t, 3), "end": round(t + .4, 3)})
+            t += .5
+        for n in vo_cases:
+            t += 2.0  # the pause between cases
+            starts[n] = round(t, 3)
+            for word in self.SENTENCES[n].split():
+                spoken.append({"word": word.lower(), "start": round(t, 3), "end": round(t + .4, 3)})
+                t += .5
+        total = t + 2.0
+        audio = root / "voice.wav"
+        with wave.open(str(audio), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(bytes(2) * int(16000 * total))
+        (root / "words.json").write_text(json.dumps({
+            "audio_sha256": hashlib.sha256(audio.read_bytes()).hexdigest(), "words": spoken}))
+        return audio, total, starts
+
+    def _build(self, root, script_cases, vo_cases, cases=None, lead=0):
+        audio, total, starts = self._make(root, script_cases, vo_cases, lead)
+        report = build(root / "script.docx", audio, root / "Run" / "Timeline", words=root / "words.json", cases=cases)
+        return report, total, starts
+
+    def test_voiceover_that_covers_only_the_ticked_cases_builds(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report, total, starts = self._build(Path(temp), range(1, 7), (3, 4), cases=(3, 4))
+            split = report["case_split"]
+            self.assertEqual(split["cut_start_seconds"], 0.0)
+            self.assertAlmostEqual(split["cut_end_seconds"], total, delta=.01)  # nothing to cut: the VO is these cases
+            self.assertEqual([c["name"] for c in report["clips"]], ["IMG 3", "IMG 4"])
+            self.assertEqual([m["case"] for m in report["case_markers"]], [3, 4])
+            self.assertAlmostEqual(report["case_markers"][0]["seconds"], starts[3], delta=.05)
+
+    def test_ticking_one_case_still_cuts_between_cases_inside_a_partial_voiceover(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report, total, starts = self._build(Path(temp), range(1, 7), (3, 4), cases=(3, 3))
+            split = report["case_split"]
+            self.assertEqual(split["cut_start_seconds"], 0.0)
+            self.assertGreater(split["cut_end_seconds"], starts[4] - 2.0)  # inside the pause before case 4
+            self.assertLess(split["cut_end_seconds"], starts[4])
+            self.assertEqual([c["name"] for c in report["clips"]], ["IMG 3"])
+
+    def test_ticking_cases_the_voiceover_lacks_is_a_clear_error(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(ValueError, r"Cases 1-2 aren't in the voiceover.*contain cases 3-4"):
+                self._build(Path(temp), range(1, 7), (3, 4), cases=(1, 2))
+
+    def test_whole_script_build_against_a_partial_voiceover_names_the_cases_it_has(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(ValueError, "seems to contain only cases 3-4; tick just those"):
+                self._build(Path(temp), range(1, 7), (3, 4))
+
+    def test_voiceover_longer_than_the_script_is_trimmed_to_the_scripts_cases(self):
+        for cases in (None, (3, 4)):
+            with tempfile.TemporaryDirectory() as temp:
+                report, total, starts = self._build(Path(temp), (3, 4), range(1, 5), cases=cases)
+                split = report["case_split"]
+                self.assertIsNotNone(split)
+                self.assertGreater(split["cut_start_seconds"], starts[3] - 2.0)  # inside the pause before case 3
+                self.assertLess(split["cut_start_seconds"], starts[3])
+                self.assertAlmostEqual(split["cut_end_seconds"], total, delta=.01)
+                self.assertLess(report["duration_seconds"], total - starts[3] + 2.0 + .01)
+                self.assertEqual([c["name"] for c in report["clips"]], ["IMG 3", "IMG 4"])
+                self.assertAlmostEqual(report["case_markers"][0]["seconds"], starts[3] - split["cut_start_seconds"], delta=.05)
+                self.assertEqual(report["voiceover_offset_seconds"], split["cut_start_seconds"])
+
+    def test_trailing_cases_the_script_lacks_are_trimmed_too(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report, total, starts = self._build(Path(temp), (1, 2), range(1, 5))
+            split = report["case_split"]
+            self.assertEqual(split["cut_start_seconds"], 0.0)
+            self.assertGreater(split["cut_end_seconds"], starts[3] - 2.0)
+            self.assertLess(split["cut_end_seconds"], starts[3])
+
+    def test_a_voiceover_that_matches_the_script_is_not_cut(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report, total, starts = self._build(Path(temp), range(1, 5), range(1, 5))
+            self.assertIsNone(report["case_split"])
+            self.assertAlmostEqual(report["duration_seconds"], total, delta=.01)
+
+    def test_a_short_unscripted_lead_in_is_kept(self):
+        with tempfile.TemporaryDirectory() as temp:
+            report, total, starts = self._build(Path(temp), range(1, 5), range(1, 5), lead=7)
+            self.assertIsNone(report["case_split"])
+            self.assertAlmostEqual(report["duration_seconds"], total, delta=.01)
+
+
 class PauseInsertTimelineTests(unittest.TestCase):
     """A pause-VO clip pushes everything after it later: audio parts, clips and markers alike."""
     LINES = ["Case 1 Start", "Officers arrived and searched the whole quiet house.",

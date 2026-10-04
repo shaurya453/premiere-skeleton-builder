@@ -1077,17 +1077,73 @@ def _quiet_gap(narration, first, last):
     return max(range(first, last), key=lambda k: narration[k + 1]["start"] - narration[k]["end"])
 
 
+# A voiceover edge is only trimmed when at least this many narrated words (about 5 seconds of speech)
+# lie outside everything the script covers: other cases, not a short lead-in or sign-off.
+MIN_EXTRA_WORDS = 15
+
+
+# Edges are located from runs of at least this many consecutive matching words. A heading such as
+# "7-Eleven" or a lone "the" can match some unrelated spot in a long voiceover; a real stretch of
+# narration never matches in runs this short.
+ANCHOR_BLOCK = 5
+
+
+def _anchored_mapping(script, narration):
+    """(all matches, matches that are part of a run of ANCHOR_BLOCK+ words): script index -> narration index."""
+    target = [w["token"] for w in narration]
+    everything, anchored = {}, {}
+    for block in SequenceMatcher(None, script, target, autojunk=False).get_matching_blocks():
+        pairs = {block.a + i: block.b + i for i in range(block.size)}
+        everything.update(pairs)
+        if block.size >= ANCHOR_BLOCK:
+            anchored.update(pairs)
+    return everything, anchored
+
+
+def _cases_phrase(numbers):
+    return f"case {numbers[0]}" if len(numbers) == 1 else f"cases {_case_label(numbers)}"
+
+
+def _case_label(numbers):
+    """[5, 6] -> "5-6", [3] -> "3", [1, 3] -> "1, 3"."""
+    numbers = sorted(numbers)
+    if len(numbers) > 1 and numbers == list(range(numbers[0], numbers[-1] + 1)):
+        return f"{numbers[0]}-{numbers[-1]}"
+    return ", ".join(str(n) for n in numbers)
+
+
+def _cases_in_voiceover(mapping, headings, script_len):
+    """Case numbers whose own words are found (65%+) in the voiceover."""
+    found = []
+    for i, heading in enumerate(headings):
+        start = heading["script_start"]
+        end = headings[i + 1]["script_start"] if i + 1 < len(headings) else script_len
+        if end > start and sum(1 for k in range(start, end) if k in mapping) / (end - start) >= .65:
+            found.append(heading["number"])
+    return found
+
+
+def _voiceover_hint(script, narration, layout):
+    """"The voiceover seems to contain only cases 5-6; tick those...", or "" when it can't tell."""
+    headings = layout.get("cases") or []
+    if not headings:
+        return ""
+    mapping = token_mapping(script, [w["token"] for w in narration])
+    found = _cases_in_voiceover(mapping, headings, len(script))
+    if not found or len(found) == len(headings):
+        return ""
+    return (f"The voiceover seems to contain only {_cases_phrase(found)}; "
+            "tick just that in the Cases list." if len(found) == 1 else
+            f"The voiceover seems to contain only {_cases_phrase(found)}; tick just those in the Cases list.")
+
+
 def _case_cut(script, narration, layout, cases, duration):
     """Where the selected cases begin and end in the audio.
 
     Each edge is the middle of the longest silence between the last spoken word of one side
     and the first spoken word of the other, so two editors' ranges meet at exactly the same
     instant. Returns (script_start, script_end, cut_start, cut_end, info)."""
-    mapping = token_mapping(script, [w["token"] for w in narration])
-    coverage = len(mapping) / max(1, len(script))
-    if coverage < .65:
-        raise ValueError(f"Script/audio token match is only {coverage:.0%}; can't find the case "
-                         "boundaries in the audio reliably.")
+    everything, mapping = _anchored_mapping(script, narration)
     mapped = sorted(mapping)
     low, high = cases
     headings = layout["cases"]
@@ -1095,6 +1151,16 @@ def _case_cut(script, narration, layout, cases, duration):
     # The hook/intro before the first heading travels with the range that holds the first case.
     script_start = 0 if chosen[0] == 0 else headings[chosen[0]]["script_start"]
     script_end = headings[chosen[-1] + 1]["script_start"] if chosen[-1] + 1 < len(headings) else len(script)
+    # Only the selected cases have to be in the voiceover: it may cover just those cases (or more).
+    in_range = sum(1 for k in range(script_start, script_end) if k in everything)
+    coverage = in_range / max(1, script_end - script_start)
+    if coverage < .65:
+        chosen_numbers = [headings[i]["number"] for i in chosen]
+        found = _cases_in_voiceover(everything, headings, len(script))
+        raise ValueError(
+            f"{_cases_phrase(chosen_numbers).capitalize()} {'isn' if len(chosen_numbers) == 1 else 'aren'}'t in the "
+            f"voiceover (only {coverage:.0%} of the words were found, so the case boundaries can't be located reliably)."
+            + (f" The voiceover seems to contain {_cases_phrase(found)}." if found else ""))
 
     def edge(position):
         """(narration index of the last matched word before `position`, of the first at/after it)."""
@@ -1110,7 +1176,14 @@ def _case_cut(script, narration, layout, cases, duration):
     if after is None:
         raise ValueError("The selected cases have no spoken narration in the voiceover.")
     start_silence = end_silence = None
-    if script_start == 0 or before is None:
+    if (script_start == 0 or before is None) and after >= MIN_EXTRA_WORDS:
+        # Nothing of the script lies before here, yet the voiceover has plenty more audio: cases that
+        # aren't in this script. Start at the longest pause among the words just before.
+        k = _quiet_gap(narration, max(0, after - 8), after)
+        start_silence = narration[k + 1]["start"] - narration[k]["end"]
+        cut_start = (narration[k]["end"] + narration[k + 1]["start"]) / 2
+        previous_ends = said(k - 5, k)
+    elif script_start == 0 or before is None:
         cut_start, previous_ends = 0.0, ""
     else:
         k = _quiet_gap(narration, before, after)
@@ -1120,8 +1193,14 @@ def _case_cut(script, narration, layout, cases, duration):
     first_word = after
     before, after = edge(script_end)
     if script_end >= len(script) or after is None:
-        cut_end, next_starts = duration, ""
         last_word = mapping[mapped[-1]]
+        if len(narration) - 1 - last_word >= MIN_EXTRA_WORDS:
+            k = _quiet_gap(narration, last_word, min(last_word + 8, len(narration) - 1))
+            end_silence = narration[k + 1]["start"] - narration[k]["end"]
+            cut_end = (narration[k]["end"] + narration[k + 1]["start"]) / 2
+            next_starts = said(k + 1, k + 6)
+        else:
+            cut_end, next_starts = duration, ""
     else:
         k = _quiet_gap(narration, before, after)
         end_silence = narration[k + 1]["start"] - narration[k]["end"]
@@ -1199,10 +1278,26 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
     with av.open(str(audio)) as container:
         duration = container.duration / av.time_base
     case_split, cut_start, script_from, audio_total = None, 0.0, 0, duration
-    if cases:
+    cut_cases, implicit = cases, False
+    if not cases and layout["cases"]:
+        # No cases ticked: build everything the script covers. If the voiceover runs on past the
+        # script (cases that aren't in it), that extra audio is trimmed; if it doesn't, nothing is cut.
+        numbers = [c["number"] for c in layout["cases"]]
+        cut_cases, implicit = (min(numbers), max(numbers)), True
+    if cut_cases:
         # Split by case: keep only this range's stretch of the voiceover, and move every word
         # time (and so every cue) to be relative to where that stretch begins.
-        script_from, script_to, cut_start, cut_end, case_split = _case_cut(script, narration, layout, cases, duration)
+        try:
+            script_from, script_to, cut_start, cut_end, case_split = _case_cut(script, narration, layout, cut_cases, duration)
+        except ValueError:
+            if not implicit:
+                raise
+            # Whole-script build the voiceover doesn't fit: leave it to the usual match check below.
+            script_from, cut_start, case_split = 0, 0.0, None
+        else:
+            if implicit and cut_start == 0.0 and cut_end >= duration:
+                script_from, cut_start, case_split = 0, 0.0, None  # nothing to trim
+    if case_split:
         duration = cut_end - cut_start
         script = script[script_from:script_to]
         for cue in cues:
@@ -1210,7 +1305,7 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
             cue["script_end"] -= script_from
         narration = [{**w, "start": w["start"] - cut_start, "end": w["end"] - cut_start} for w in narration
                      if cut_start <= (w["start"] + w["end"]) / 2 < cut_end]
-        label = f"cases {cases[0]}-{cases[1] if cases[1] else 'end'}"
+        label = f"cases {cut_cases[0]}-{cut_cases[1] if cut_cases[1] else 'end'}"
         print(f"Case split ({label}): voiceover {clock(cut_start)} to {clock(cut_end)}. "
               f"Starts: \"{case_split['audio_starts_with']}\" ... ends: \"{case_split['audio_ends_with']}\"", flush=True)
         for edge, silence in (("start", case_split["start_silence_seconds"]), ("end", case_split["end_silence_seconds"])):
@@ -1218,7 +1313,13 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
                 warnings.append(f"The pause at the {edge} cut is only {silence:.2f}s long; check that the audio "
                                 "really splits between two cases there.")
     mapping = {}
-    coverage = align_cues(script, cues, narration, mapping_out=mapping)
+    try:
+        coverage = align_cues(script, cues, narration, mapping_out=mapping)
+    except ValueError as error:
+        hint = _voiceover_hint(script, narration, layout) if not cases else ""
+        if hint:
+            raise ValueError(f"{error}\n{hint}") from None
+        raise
     audio_dir.mkdir(parents=True, exist_ok=True)
     wav = audio_dir / "voiceover.wav"
     ffmpeg = ffmpeg_exe()
@@ -1435,7 +1536,8 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
                              c["start_frame"], c["end_frame"], c["passage"], c["path"], c.get("source_url", "")])
     # One sequence marker per case, after any pause-VO inserts have pushed the later audio along.
     in_range = [h for h in layout["cases"] if not cases or (cases[0] <= h["number"] and (cases[1] is None or h["number"] <= cases[1]))]
-    case_markers = case_marker_times(script, narration, mapping, in_range, script_from)
+    # Anchored matches only: a stray match of a heading's words must not place a case marker.
+    case_markers = case_marker_times(script, narration, _anchored_mapping(script, narration)[1], in_range, script_from)
     voiceover_offset, voiceover_frames = round(cut_start * FPS), math.ceil(audio_total * FPS)
     for marker in case_markers:
         frame = round(marker["seconds"] * FPS)
