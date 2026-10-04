@@ -34,14 +34,45 @@ class JobTests(unittest.TestCase):
             jobs.write_json(folder/'run.json',{'status':'completed','result':str(result)})
             self.assertEqual(jobs.inspect_run(folder)['display_status'],'Completed')
 
+    def test_write_json_waits_out_a_reader_holding_the_file_open(self):
+        # On Windows the final os.replace fails while anything has the target open. The app polls run.json
+        # every 1.5s, so a worker's last status write used to die now and then and leave the run "running".
+        import threading
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as t:
+            target = Path(t) / 'run.json'
+            jobs.write_json(target, {'status': 'running'})
+            held, release = threading.Event(), threading.Event()
+
+            def reader():
+                with open(target, 'rb'):
+                    held.set()
+                    release.wait(5)
+
+            thread = threading.Thread(target=reader)
+            thread.start()
+            held.wait(5)
+            threading.Timer(0.4, release.set).start()
+            started = time.monotonic()
+            jobs.write_json(target, {'status': 'completed'})
+            thread.join()
+            self.assertEqual(jobs.read_json(target), {'status': 'completed'})
+            self.assertEqual([p.name for p in Path(t).iterdir()], ['run.json'])  # no stray temp files
+            if sys.platform == 'win32':
+                self.assertGreaterEqual(time.monotonic() - started, 0.3)  # it really had to wait
+
     def test_worker_survives_launcher_exit_and_saves_failure_log(self):
-        with tempfile.TemporaryDirectory() as t:
+        # The worker is a real detached process. It holds run.log open until it exits, and Windows can't
+        # delete an open file, so the test must wait for it to finish before its temp folder is removed.
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as t:
             root=Path(t); (root/'.cache').mkdir()
             (root/'skeleton_builder.py').write_text('import time\ntime.sleep(.3)\nprint("visible failure", flush=True)\nraise SystemExit(7)\n')
             run=root/'run'; run.mkdir()
             (root/'a.docx').write_text('doc'); (root/'c.mp3').write_text('audio')
             jobs.write_json(run/'run.json',{'status':'starting','result':str(run/'Timeline'),'config':{'docx':str(root/'a.docx'),'audio':str(root/'c.mp3'),'videos':False}})
-            code=f'import job_worker; from pathlib import Path; job_worker.ROOT=Path({str(root)!r}); job_worker.run({str(run)!r})'
+            # The worker's lock file lives in cache_dir(); point it at this test's folder so a build running
+            # elsewhere (the real app, another test process) can't make this worker refuse to start.
+            code=(f'import job_worker; from pathlib import Path; job_worker.ROOT=Path({str(root)!r}); '
+                  f'job_worker.cache_dir=lambda: Path({str(root/".cache")!r}); job_worker.run({str(run)!r})')
             # A short-lived launcher spawns the independent supervisor then exits.
             launch=f'import subprocess,sys; f=open({str(run/"run.log")!r},"w"); subprocess.Popen([sys.executable,"-c",{code!r}],stdin=subprocess.DEVNULL,stdout=f,stderr=f,start_new_session=True)'
             subprocess.run([sys.executable,'-c',launch],check=True)
@@ -50,8 +81,13 @@ class JobTests(unittest.TestCase):
                 state=jobs.read_json(run/'run.json')
                 if state.get('status')=='failed': break
                 time.sleep(.1)
-            self.assertEqual(state.get('exit_code'),7)
-            self.assertIn('visible failure',(run/'run.log').read_text())
+            try:
+                self.assertEqual(state.get('exit_code'),7)
+                self.assertIn('visible failure',(run/'run.log').read_text())
+            finally:
+                exit_deadline=time.monotonic()+10
+                while jobs.alive(state.get('pid')) and time.monotonic()<exit_deadline:
+                    time.sleep(.1)
 
     def test_reaps_orphaned_builder_when_job_worker_pid_is_dead(self):
         # Simulates the exact failure this guards against - and does it with real processes,

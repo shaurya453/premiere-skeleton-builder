@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 
 from paths import FROZEN, NO_WINDOW, ROOT, cache_dir, default_data_root
@@ -25,7 +26,18 @@ def write_json(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
     tmp.write_text(json.dumps(data, indent=2))
-    tmp.replace(path)
+    # On Windows the swap fails with PermissionError while another process (the app polling run.json,
+    # a second window) has the target open, even for a few microseconds. Left unhandled, a finished
+    # build's last status write could die there and leave the run marked 'running' for good, so retry.
+    for attempt in range(100):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == 99:
+                tmp.unlink(missing_ok=True)
+                raise
+            time.sleep(0.05)
 
 
 def alive(pid):
