@@ -130,7 +130,7 @@ def transcribe(audio, destination, model_name="small.en", device="auto", models_
         if dev == "cpu":
             raise
         # CUDA libraries can be missing until the first real inference; retry on the CPU.
-        print(f"GPU failed during recognition ({error}); retrying on CPU.", flush=True)
+        print(f"Recognition failed on {dev} ({type(error).__name__}: {error}); retrying on CPU in case it was a GPU problem.", flush=True)
         model = WhisperModel(model_path, device="cpu", compute_type="int8", cpu_threads=6, download_root=root)
         words, info = recognise(model)
     result = {"audio_sha256": digest, "model": model_name, "duration": info.duration,

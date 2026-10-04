@@ -1,4 +1,5 @@
 import tempfile
+from pathlib import Path
 import unittest
 from unittest.mock import patch
 
@@ -48,6 +49,24 @@ class ModelDownloadProgressTests(unittest.TestCase):
         self.assertEqual(result, "/fake/model/dir")
         self.assertEqual(reported[-1], 100)
         self.assertEqual(reported, sorted(reported))  # monotonic, no regressions
+
+
+class AudioDecodingTests(unittest.TestCase):
+    def test_faster_whisper_can_decode_a_voiceover_with_the_installed_pyav(self):
+        # faster-whisper opens audio through PyAV with arguments newer PyAV releases dropped
+        # (19.x removed `metadata_errors`), which made every new transcription crash. No model
+        # needed: this only exercises the audio-loading step that runs before recognition.
+        import wave
+        from faster_whisper.audio import decode_audio
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "tone.wav"
+            with wave.open(str(path), "wb") as wav:
+                wav.setnchannels(1)
+                wav.setsampwidth(2)
+                wav.setframerate(16000)
+                wav.writeframes(bytes(2) * 16000)  # one second
+            samples = decode_audio(str(path), sampling_rate=16000)
+        self.assertAlmostEqual(len(samples) / 16000, 1.0, delta=0.05)
 
 
 if __name__ == "__main__":
