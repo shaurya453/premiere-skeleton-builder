@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -56,13 +57,20 @@ class CleanFilenameTests(unittest.TestCase):
 
 
 class RestrictedCharactersTests(unittest.TestCase):
+    def test_root_and_separators_are_not_flagged_on_a_posix_path(self):
+        self.assertEqual(restricted_characters("/Users/ana/Projects/Nikki (cases 1)"), "")
+
+    def test_a_folder_you_chose_is_flagged_on_a_posix_path(self):
+        self.assertEqual(restricted_characters("/Users/ana/Q&A, 2024/Projects/Media"), "&,")
+        self.assertEqual(restricted_characters("/Users/ana/Bob's Projects"), "'")
+
+    @unittest.skipUnless(os.name == "nt", "drive letters only exist on Windows")
     def test_drive_letter_and_separators_are_not_flagged(self):
         self.assertEqual(restricted_characters(r"E:\Apps\Skeleton Builder\Projects\Nikki (cases 1)"), "")
-        self.assertEqual(restricted_characters("/Users/ana/Projects/Case 1"), "")
 
+    @unittest.skipUnless(os.name == "nt", "drive letters only exist on Windows")
     def test_a_folder_you_chose_is_flagged(self):
         self.assertEqual(restricted_characters(r"E:\Q&A, 2024\Projects\Media"), "&,")
-        self.assertEqual(restricted_characters("/Users/ana/Bob's Projects"), "'")
 
 
 class CallersUseTheCleanerTests(unittest.TestCase):
