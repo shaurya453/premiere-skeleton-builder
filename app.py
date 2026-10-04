@@ -13,6 +13,7 @@ import threading
 import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
 
 try:
     from tkinterdnd2 import DND_FILES, TkinterDnD
@@ -43,8 +44,240 @@ BG, PANEL, FIELD, FG, MUTED, ACCENT, BORDER = "#16181d", "#1e2128", "#262a33", "
 WARN_FG = "#e2a03f"
 
 
+def enable_dpi_awareness():
+    """Windows only: opt in to real pixels so text is crisp on scaled displays instead of being
+    bitmap-stretched by the OS. Must run before the first Tk window exists (Tk reads the screen's
+    DPI when it initialises). Harmless if it was already set."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)  # system DPI aware
+        except Exception:
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def ui_scale(window):
+    """1.0 at 96 dpi, 1.5 at 150% and so on (follows Tk's own scaling)."""
+    try:
+        return max(0.75, window.winfo_fpixels("1i") / 96.0)
+    except tk.TclError:
+        return 1.0
+
+
+def work_area(window):
+    """(x, y, width, height) of the usable desktop: the Windows work area excludes the taskbar."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            rect = wintypes.RECT()
+            if ctypes.windll.user32.SystemParametersInfoW(48, 0, ctypes.byref(rect), 0):  # SPI_GETWORKAREA
+                return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
+        except Exception:
+            pass
+    return 0, 0, window.winfo_screenwidth(), window.winfo_screenheight()
+
+
+def place_window(window, scale):
+    """Initial size from the screen (never more than ~92% of it, so it also fits a 1366x768
+    laptop), a minimum small enough for that screen, centred on the usable desktop."""
+    ax, ay, aw, ah = work_area(window)
+    width = min(round(920 * scale), int(aw * 0.92))
+    height = min(round(780 * scale), int(ah * 0.92))
+    window.minsize(min(round(740 * scale), width), min(round(520 * scale), height))
+    x = ax + max(0, (aw - width) // 2)
+    y = ay + max(0, (ah - height - round(40 * scale)) // 2)
+    window.geometry(f"{width}x{height}+{x}+{y}")
+
+
+def wheel_units(event, notch=3, window_system=None):
+    """Signed scroll distance (in canvas/list units, positive = down) for a mouse-wheel event.
+    Windows/Linux-wheel: one notch is +-120 delta (or Button-4/5 on X11) and scrolls `notch` units;
+    macOS reports small deltas (1, 2, 3...) that are already a distance. Never 0 for a real event."""
+    num = getattr(event, "num", 0)
+    if num in (4, 5):
+        return -notch if num == 4 else notch
+    delta = getattr(event, "delta", 0)
+    if not delta:
+        return 0
+    if window_system == "aqua":
+        steps = -delta
+    else:
+        notches = max(1, abs(delta) // 120)  # touchpads send partial notches: still move
+        steps = (-notches if delta > 0 else notches) * notch
+    return steps
+
+
+def _can_scroll(widget, units):
+    lo, hi = widget.yview()
+    return not ((units < 0 and lo <= 0.0001) or (units > 0 and hi >= 0.9999))
+
+
+def route_wheel(root, event, under=None):
+    """One wheel handler for the whole app. Finds what is under the pointer and scrolls the
+    innermost scrollable *page* (a make_scrollable canvas) that can still move that way, so the
+    wheel works over any child widget and a list at its end hands off to the page around it.
+    Widgets that scroll themselves (Text, Listbox, Treeview) are left to Tk unless their content
+    fits entirely, in which case the wheel passes through to the page. Returns True if it scrolled."""
+    if event.state & 0x1:  # Shift+wheel is horizontal: not ours
+        return False
+    try:
+        widget = under if under is not None else root.winfo_containing(event.x_root, event.y_root)  # `under`: for tests
+    except (KeyError, tk.TclError):
+        return False
+    system = root.tk.call("tk", "windowingsystem")
+    while widget is not None:
+        if isinstance(widget, (tk.Text, tk.Listbox, ttk.Treeview)):
+            lo, hi = widget.yview()
+            if lo > 0.0 or hi < 1.0:
+                return False  # scrolls itself
+        page = getattr(widget, "_wheel_canvas", None)
+        if page is not None:
+            units = wheel_units(event, page._wheel_notch, system)
+            if units and _can_scroll(page, units):
+                page.yview_scroll(units, "units")
+                return True
+        widget = widget.master
+    return False
+
+
+def reveal_focus(event):
+    """Keep the focused widget on screen: Tab-ing into something below the fold of a scrolling page
+    (or of the case list) scrolls it into view."""
+    widget = event.widget
+    if not isinstance(widget, tk.Misc):
+        return
+    try:
+        height = widget.winfo_height()
+        node = widget.master
+        while node is not None:
+            if getattr(node, "_wheel_canvas", None) is node:  # a scrolling canvas (not its frame)
+                view = node.winfo_height()
+                step = max(1, node._wheel_increment)
+                top = widget.winfo_rooty() - node.winfo_rooty()
+                if 1 < height <= view and (top < 0 or top + height > view):
+                    if top < 0:
+                        node.yview_scroll(top // step, "units")  # floor of a negative: rounds away from 0
+                    else:
+                        node.yview_scroll(-(-(top + height - view) // step), "units")  # ceil
+                    node.update_idletasks()  # canvas items only move on redraw
+            node = node.master
+    except tk.TclError:
+        pass
+
+
+def install_wheel_router(root):
+    system = root.tk.call("tk", "windowingsystem")
+    sequences = ["<MouseWheel>"] + (["<Button-4>", "<Button-5>"] if system == "x11" else [])
+    for sequence in sequences:
+        root.bind_all(sequence, lambda e: route_wheel(root, e), add="+")
+        # A readonly combobox would otherwise change its value under a wheel meant for the page.
+        root.bind_class("TCombobox", sequence, lambda e: (route_wheel(root, e), "break")[1])
+    root.bind_all("<FocusIn>", reveal_focus, add="+")
+
+
+class Scrollable:
+    """A vertically scrolling area: a canvas holding `inner` (put your widgets there) plus a
+    scrollbar. `inner` always matches the canvas width, the scroll region follows its content, and
+    the wheel works anywhere over it (see route_wheel). `fill=True` makes the content at least as
+    tall as the view so expanding children (a log box) stretch; use it only for content whose size
+    does not change by itself. Used for every tab and for the case list."""
+
+    def __init__(self, parent, padding=0, increment=16, notch=3, fill=False):
+        self.fill = fill
+        self.outer = ttk.Frame(parent)
+        self.outer.columnconfigure(0, weight=1)
+        self.outer.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(self.outer, bg=BG, highlightthickness=0, bd=0, width=1, height=1,
+                                yscrollincrement=increment)
+        self.scrollbar = ttk.Scrollbar(self.outer, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.inner = ttk.Frame(self.canvas, padding=padding)
+        self._item = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self._applied = None
+        for target in (self.canvas, self.outer):  # outer: the wheel over the scrollbar scrolls this too
+            target._wheel_canvas = self.canvas
+        self.canvas._wheel_notch, self.canvas._wheel_increment = notch, increment
+        self.canvas.bind("<Configure>", self.sync)
+        self.inner.bind("<Configure>", self.sync)
+
+    def sync(self, _event=None):
+        width, view = self.canvas.winfo_width(), self.canvas.winfo_height()
+        need = self.inner.winfo_reqheight()
+        height = max(view, need) if self.fill else need
+        applied = (width, height)
+        if width <= 1 or applied == self._applied:
+            return
+        self._applied = applied
+        # 0 = no forced height unless filling: the frame then follows what its content asks for.
+        self.canvas.itemconfigure(self._item, width=width, height=height if self.fill else 0)
+        self.canvas.configure(scrollregion=(0, 0, width, height))
+
+    def set_increment(self, pixels):
+        self.canvas.configure(yscrollincrement=pixels)
+        self.canvas._wheel_increment = pixels
+
+    def show_scrollbar(self, show):
+        if show:
+            self.scrollbar.grid()
+        else:
+            self.scrollbar.grid_remove()
+
+
+def autowrap(label, container, margin=0, minimum=120):
+    """Make `label` wrap at the width actually available (`container`'s width minus `margin`, an
+    int or a callable) instead of a fixed pixel width, so long text neither gets cut off nor makes
+    the window grow sideways."""
+    def update(_event=None):
+        room = margin() if callable(margin) else margin
+        width = max(minimum, container.winfo_width() - room)
+        if str(label.cget("wraplength")) != str(width):
+            label.configure(wraplength=width)
+    container.bind("<Configure>", update, add="+")
+    update()
+
+
+def flow_layout(container, widgets, gap=8):
+    """Lay `widgets` out left to right inside `container`, starting a new row whenever the next one
+    would not fit, so a row of buttons never runs off the edge of a narrow window."""
+    last = [None]
+
+    def layout(_event=None):
+        width = container.winfo_width()
+        if width <= 1:
+            width = 10 ** 6  # not laid out yet: one row, corrected on the first <Configure>
+        if last[0] == width:
+            return
+        last[0] = width
+        row = column = used = 0
+        for widget in widgets:
+            need = widget.winfo_reqwidth()
+            if column and used + need > width:
+                row, column, used = row + 1, 0, 0
+            widget.grid(row=row, column=column, sticky="w", padx=(0, gap), pady=(0, gap if row else 0))
+            column += 1
+            used += need + gap
+    container.bind("<Configure>", layout, add="+")
+    layout()
+
+
+def other_columns(group, column, base):
+    """Margin for autowrap() of a label in grid column `column` of `group`: the widths of the
+    other columns plus `base` for padding."""
+    def room():
+        return base + sum(group.grid_bbox(c, 0)[2] for c in range(group.grid_size()[0]) if c != column)
+    return room
+
+
 def apply_dark_theme(window):
     style = ttk.Style(window)
+    scale = ui_scale(window)
     style.theme_use("clam")
     window.configure(bg=BG)
     style.configure(".", background=BG, foreground=FG, fieldbackground=FIELD, bordercolor=BORDER,
@@ -59,7 +292,16 @@ def apply_dark_theme(window):
               selectbackground=[("readonly", FIELD)], selectforeground=[("readonly", FG)])
     style.configure("TCheckbutton", background=BG, foreground=FG, indicatorcolor=FIELD)
     style.map("TCheckbutton", background=[("active", BG)], indicatorcolor=[("selected", ACCENT)])
-    style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=FG, bordercolor=BORDER)
+    # The case-selection rows: a big indicator and larger text so they are easy to see and hit.
+    style.configure("Case.TCheckbutton", font=(UI_FONT, 12), padding=(round(8 * scale), round(6 * scale)),
+                    indicatorsize=round(22 * scale), indicatormargin=(0, 0, round(10 * scale), 0),
+                    indicatorbackground=FIELD, indicatorforeground="#ffffff",
+                    upperbordercolor=MUTED, lowerbordercolor=MUTED)
+    style.map("Case.TCheckbutton", background=[("active", PANEL)],
+              indicatorbackground=[("selected", ACCENT), ("active", "#323846")],
+              upperbordercolor=[("selected", ACCENT), ("active", FG)], lowerbordercolor=[("selected", ACCENT), ("active", FG)])
+    style.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=FG, bordercolor=BORDER,
+                    rowheight=round(22 * scale))
     style.configure("Treeview.Heading", background=FIELD, foreground=FG, bordercolor=BORDER)
     style.map("Treeview", background=[("selected", ACCENT)], foreground=[("selected", "#ffffff")])
     style.configure("Horizontal.TProgressbar", background=ACCENT, troughcolor=PANEL, bordercolor=BORDER)
@@ -132,14 +374,20 @@ def skeleton_xml(run):
 
 
 def main(smoke_test: bool = False):
+    enable_dpi_awareness()  # before the first Tk window, so Tk sees the real screen DPI
     window = TkinterDnD.Tk() if TkinterDnD else tk.Tk()
     if smoke_test:
         window.withdraw()
     window.title("Premiere Pro Skeleton Builder")
-    window.geometry("900x720")
-    window.minsize(820, 640)
-    window.configure(padx=16, pady=12)
+    scale = ui_scale(window)
+
+    def px(n):
+        return round(n * scale)
+
+    place_window(window, scale)
+    window.configure(padx=px(16), pady=px(12))
     apply_dark_theme(window)
+    install_wheel_router(window)
     if not smoke_test:
         window.lift()
         window.attributes("-topmost", True)
@@ -152,20 +400,22 @@ def main(smoke_test: bool = False):
     last_log = [None]
     notified_runs = set()
 
-    ttk.Label(window, text="Premiere Pro Skeleton Builder", font=(UI_FONT, 17, "bold")).pack(anchor="w")
-    ttk.Label(window, text="Script + voiceover in, editable Premiere timeline out. Builds keep running if you close this window.",
-              foreground=MUTED).pack(anchor="w", pady=(0, 8))
+    ttk.Label(window, text="Premiere Pro Skeleton Builder", font=(UI_FONT, 17, "bold")).pack(anchor="w", pady=(0, px(8)))
 
     tabs = ttk.Notebook(window)
     tabs.pack(fill="both", expand=True)
-    build_tab = ttk.Frame(tabs, padding=14)
-    runs_tab = ttk.Frame(tabs, padding=14)
-    paths_tab = ttk.Frame(tabs, padding=14)
-    update_tab = ttk.Frame(tabs, padding=14)
-    tabs.add(build_tab, text="  Build  ")
-    tabs.add(runs_tab, text="  Runs  ")
-    tabs.add(paths_tab, text="  Paths & Options  ")
-    tabs.add(update_tab, text="  Update  ")
+    # Every tab is a scrolling page, so nothing is ever out of reach in a small window. The Runs tab
+    # stretches its tree/log to fill a tall window (fill=True), the others are as tall as their content.
+    page_increment = px(16)
+    build_page = Scrollable(tabs, padding=px(14), increment=page_increment)
+    runs_page = Scrollable(tabs, padding=px(14), increment=page_increment, fill=True)
+    paths_page = Scrollable(tabs, padding=px(14), increment=page_increment)
+    update_page = Scrollable(tabs, padding=px(14), increment=page_increment)
+    build_tab, runs_tab, paths_tab, update_tab = build_page.inner, runs_page.inner, paths_page.inner, update_page.inner
+    tabs.add(build_page.outer, text="  Build  ")
+    tabs.add(runs_page.outer, text="  Runs  ")
+    tabs.add(paths_page.outer, text="  Paths & Options  ")
+    tabs.add(update_page.outer, text="  Update  ")
 
     # ---------------- Paths & Options tab (settings live here) ----------------
     settings_vars = {
@@ -312,7 +562,9 @@ def main(smoke_test: bool = False):
             entry.bind("<Return>", commit_location(key))
             entry.bind("<FocusOut>", commit_location(key))
         ttk.Button(paths_group, text="Browse…", command=command).grid(row=r * 2, column=2, pady=(6, 0))
-        ttk.Label(paths_group, text=hint, foreground=MUTED, font=(UI_FONT, 9)).grid(row=r * 2 + 1, column=1, sticky="w", padx=8)
+        hint_label = ttk.Label(paths_group, text=hint, foreground=MUTED, font=(UI_FONT, 9), justify="left")
+        hint_label.grid(row=r * 2 + 1, column=1, sticky="w", padx=8)
+        autowrap(hint_label, paths_group, other_columns(paths_group, 1, px(2 * 12 + 16 + 8)))
 
     options_group = ttk.LabelFrame(paths_tab, text=" Options ", padding=12)
     options_group.pack(fill="x", pady=(12, 0))
@@ -368,8 +620,10 @@ def main(smoke_test: bool = False):
     ttk.Combobox(options_group, textvariable=settings_vars["whisper_model"], values=WHISPER_MODELS, width=18).grid(row=3, column=1, sticky="w")
     ttk.Label(options_group, text="Runs on").grid(row=3, column=3, sticky="w", padx=(0, 6))
     ttk.Combobox(options_group, textvariable=settings_vars["device"], values=["auto", "cpu", "cuda"], state="readonly", width=8).grid(row=3, column=4, sticky="w")
-    ttk.Label(options_group, text="Speech recognition runs on your computer (faster-whisper). 'auto' uses the graphics card when available.",
-              foreground=MUTED, font=(UI_FONT, 9)).grid(row=4, column=0, columnspan=6, sticky="w", pady=(6, 0))
+    speech_hint = ttk.Label(options_group, text="Speech recognition runs on your computer (faster-whisper). 'auto' uses the graphics card when available.",
+                            foreground=MUTED, font=(UI_FONT, 9), justify="left")
+    speech_hint.grid(row=4, column=0, columnspan=6, sticky="w", pady=(6, 0))
+    autowrap(speech_hint, options_group, px(2 * 12 + 8))
 
     # ---------------- Build tab ----------------
     preset_row = ttk.Frame(build_tab)
@@ -482,7 +736,9 @@ def main(smoke_test: bool = False):
                     on_change()
 
         ttk.Button(inputs_group, text="Browse…", command=browse).grid(row=row * 2, column=2, pady=(4, 0))
-        ttk.Label(inputs_group, text=hint, foreground=MUTED, font=(UI_FONT, 9)).grid(row=row * 2 + 1, column=1, sticky="w", padx=8)
+        hint_label = ttk.Label(inputs_group, text=hint, foreground=MUTED, font=(UI_FONT, 9), justify="left")
+        hint_label.grid(row=row * 2 + 1, column=1, sticky="w", padx=8)
+        autowrap(hint_label, inputs_group, other_columns(inputs_group, 1, px(2 * 12 + 16 + 8)))
         if on_change:
             entry.bind("<Return>", lambda _e: on_change())
             entry.bind("<FocusOut>", lambda _e: on_change())
@@ -490,24 +746,25 @@ def main(smoke_test: bool = False):
 
     script_entry = add_input(0, "Script", script_var, "Google Doc link (must be viewable by anyone with the link) or a .docx file.", "*.docx", resolve_script_async)
     audio_entry = add_input(1, "Voiceover", audio_var, "Drop an audio file here, paste a Google Drive link, or browse.", "*.mp3 *.wav *.m4a *.aac *.flac")
-    ttk.Label(inputs_group, textvariable=inspect_status, wraplength=780, justify="left").grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+    status_label = ttk.Label(inputs_group, textvariable=inspect_status, justify="left")
+    status_label.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+    autowrap(status_label, inputs_group, px(2 * 12 + 8))
 
     # Stage 2: which cases this editor is building. Per-run, deliberately not remembered.
     cases_group = ttk.LabelFrame(build_tab, text=" 2 · Cases ", padding=12)
     cases_group.pack(fill="x", pady=(10, 0))
     case_note = tk.StringVar(value="Add a script to see its cases.")
-    ttk.Label(cases_group, textvariable=case_note, foreground=MUTED, font=(UI_FONT, 9), wraplength=780,
-              justify="left").pack(anchor="w")
-    case_body = ttk.Frame(cases_group)  # packed only while the script has cases
-    case_canvas = tk.Canvas(case_body, bg=BG, highlightthickness=0)
-    case_scroll = ttk.Scrollbar(case_body, orient="vertical", command=case_canvas.yview)
-    case_rows = ttk.Frame(case_canvas)
-    case_canvas.create_window((0, 0), window=case_rows, anchor="nw")
-    case_canvas.configure(yscrollcommand=case_scroll.set)
-    case_rows.bind("<Configure>", lambda _e: case_canvas.configure(scrollregion=case_canvas.bbox("all")))
-    case_canvas.bind("<MouseWheel>", lambda e: case_canvas.yview_scroll(-1 if e.delta > 0 else 1, "units"))
-    case_canvas.pack(side="left", fill="x", expand=True)
-    case_scroll.pack(side="right", fill="y")
+    case_note_label = ttk.Label(cases_group, textvariable=case_note, foreground=MUTED, font=(UI_FONT, 9), justify="left")
+    case_note_label.pack(anchor="w")
+    autowrap(case_note_label, cases_group, px(2 * 12 + 8))
+    case_hint_label = ttk.Label(cases_group, text="Tick only the cases your voiceover covers: it may cover all of them or just some.",
+                                foreground=MUTED, font=(UI_FONT, 9), justify="left")
+    case_hint_label.pack(anchor="w")
+    autowrap(case_hint_label, cases_group, px(2 * 12 + 8))
+    # The list scrolls on its own (wheel anywhere over it, including over the rows, and the keyboard);
+    # at either end the wheel passes on to the page behind it. Its height follows the room available.
+    case_list = Scrollable(cases_group, increment=px(32))
+    case_body, case_canvas, case_rows = case_list.outer, case_list.canvas, case_list.inner  # packed only while the script has cases
     case_buttons = ttk.Frame(cases_group)
     ttk.Button(case_buttons, text="Select all", command=lambda: set_all_cases(True)).pack(side="left")
     ttk.Button(case_buttons, text="Clear", command=lambda: set_all_cases(False)).pack(side="left", padx=(6, 0))
@@ -552,6 +809,56 @@ def main(smoke_test: bool = False):
             var.set(value)
         refresh_case_note()
 
+    case_row_widgets = []  # (Checkbutton, case) in list order
+    case_font = tkfont.Font(family=UI_FONT, size=12)  # same font as the Case.TCheckbutton style
+
+    def set_case_tab_stop(active):
+        for row, _case in case_row_widgets:
+            row.configure(takefocus=1 if row is active else 0)
+
+    def focus_case_row(index):
+        if case_row_widgets:
+            case_row_widgets[max(0, min(index, len(case_row_widgets) - 1))][0].focus_set()
+        return "break"
+
+    def fit_case_rows(_event=None):
+        """Row text is cut with an ellipsis (title only, never the cue counts) to the room the row
+        really has, so the list never needs a horizontal scrollbar."""
+        room = max(px(160), case_canvas.winfo_width() - px(2 * 8 + 22 + 10 + 12))
+        for row, c in case_row_widgets:
+            title, tail = c["title"], f"   ·   {c['image_cues']} image, {c['video_cues']} video cue(s)"
+            if case_font.measure(title + tail) <= room:
+                text = title + tail
+            else:  # longest title prefix that still fits next to the ellipsis and the counts
+                lo, hi = 0, len(title)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if case_font.measure(title[:mid].rstrip() + "…" + tail) <= room:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                text = title[:lo].rstrip() + "…" + tail
+            if row.cget("text") != text:
+                row.configure(text=text)
+
+    def size_case_list(_event=None):
+        """List height: every case when there are few, otherwise about half the page (never fewer than
+        four rows), in whole rows of whatever height the font/DPI makes them."""
+        if not case_row_widgets:
+            return
+        count = len(case_row_widgets)
+        row_height = max(1, case_row_widgets[0][0].winfo_reqheight())
+        viewport = build_page.canvas.winfo_height()
+        if viewport <= 1:
+            viewport = window.winfo_height() * 0.7
+        visible = min(count, max(4, int(viewport * 0.5 // row_height)))
+        case_list.set_increment(row_height)
+        case_canvas.configure(height=visible * row_height)
+        case_list.show_scrollbar(count > visible)
+
+    case_canvas.bind("<Configure>", fit_case_rows, add="+")
+    build_page.canvas.bind("<Configure>", size_case_list, add="+")
+
     def show_cases(cases, ok=True):
         """Rebuild the checkbox list for `cases` ([{number, title, image_cues, video_cues}]);
         `ok` is False when there is no usable script. The same list again (a re-check of the
@@ -562,6 +869,7 @@ def main(smoke_test: bool = False):
         keep = {n: var.get() for n, var in case_vars.items()} if same_cases else {}
         for child in case_rows.winfo_children():
             child.destroy()
+        case_row_widgets.clear()
         case_info[:] = list(cases)
         case_vars.clear()
         if not cases:
@@ -570,18 +878,26 @@ def main(smoke_test: bool = False):
             case_note.set("No case headings found — the whole video will be built." if ok
                           else "Add a valid script to see its cases.")
             return
-        for c in cases:
+        for index, c in enumerate(cases):
             var = tk.BooleanVar(value=keep.get(c["number"], True))
             case_vars[c["number"]] = var
-            title = c["title"] if len(c["title"]) <= 70 else c["title"][:69] + "…"
-            counts = f"{c['image_cues']} image, {c['video_cues']} video cue(s)"
-            ttk.Checkbutton(case_rows, text=f"{title}   ·   {counts}", variable=var,
-                            command=on_case_toggled).pack(anchor="w", pady=1)
-        case_canvas.configure(height=min(len(cases), 8) * 26)
+            # The whole row is the Checkbutton, so a click anywhere on it toggles the case.
+            row = ttk.Checkbutton(case_rows, style="Case.TCheckbutton", variable=var, command=on_case_toggled,
+                                  takefocus=1 if index == 0 else 0)  # one Tab stop for the list
+            row.pack(fill="x")
+            row.bind("<FocusIn>", lambda _e, row=row: set_case_tab_stop(row))
+            row.bind("<Up>", lambda _e, i=index: focus_case_row(i - 1))
+            row.bind("<Down>", lambda _e, i=index: focus_case_row(i + 1))
+            row.bind("<Home>", lambda _e: focus_case_row(0))
+            row.bind("<End>", lambda _e: focus_case_row(len(case_row_widgets) - 1))
+            case_row_widgets.append((row, c))
         case_body.pack_forget()
         case_buttons.pack_forget()
         case_body.pack(fill="x", pady=(6, 0))
         case_buttons.pack(anchor="w", pady=(6, 0))
+        window.update_idletasks()
+        fit_case_rows()
+        size_case_list()
         on_case_toggled()
 
     def on_drop(event):
@@ -601,8 +917,12 @@ def main(smoke_test: bool = False):
 
     build_frame = ttk.Frame(build_tab)
     build_frame.pack(fill="x", pady=(14, 0))
-    progress_bar = ttk.Progressbar(build_frame, mode="indeterminate")
-    phase_label = ttk.Label(build_frame, text="", foreground=MUTED)
+    build_buttons = ttk.Frame(build_frame)  # Build / Preview / Stop, with the progress bar on its own row below
+    build_buttons.pack(fill="x")
+    progress_row = ttk.Frame(build_frame)
+    progress_row.pack(fill="x", pady=(px(8), 0))
+    progress_bar = ttk.Progressbar(progress_row, mode="indeterminate")
+    phase_label = ttk.Label(progress_row, text="", foreground=MUTED)
 
     def open_path(path):
         try:
@@ -723,9 +1043,9 @@ def main(smoke_test: bool = False):
 
         resolve_script_async(quiet=False, then=after_resolve)
 
-    build_btn = ttk.Button(build_frame, text="⚡  Build Skeleton", command=launch, padding=(14, 7))
+    build_btn = ttk.Button(build_buttons, text="⚡  Build Skeleton", command=launch, padding=(14, 7))
     build_btn.pack(side="left")
-    preview_btn = ttk.Button(build_frame, text="👁  Preview cues", command=preview, padding=(10, 7))
+    preview_btn = ttk.Button(build_buttons, text="👁  Preview cues", command=preview, padding=(10, 7))
     preview_btn.pack(side="left", padx=(8, 0))
 
     def stop_current_run():
@@ -739,9 +1059,9 @@ def main(smoke_test: bool = False):
             stop_job(active["folder"])
             refresh()
 
-    stop_btn = ttk.Button(build_frame, text="⏹  Stop", command=stop_current_run, padding=(10, 7))
+    stop_btn = ttk.Button(build_buttons, text="⏹  Stop", command=stop_current_run, padding=(10, 7))
     stop_btn.pack(side="left", padx=(8, 0))
-    phase_label.pack(side="left", padx=14)
+    phase_label.pack(side="left", padx=(0, 14))
     progress_bar.pack(side="right", fill="x", expand=True)
 
     # ---------------- Queue: extra submissions while a build is already running ----------------
@@ -775,7 +1095,9 @@ def main(smoke_test: bool = False):
     current_var = tk.StringVar(value="No run yet.")
     result_group = ttk.LabelFrame(build_tab, text=" Latest / selected run ", padding=12)
     result_group.pack(fill="x", pady=(14, 0))
-    ttk.Label(result_group, textvariable=current_var, wraplength=780, justify="left").pack(anchor="w", pady=(0, 8))
+    current_label = ttk.Label(result_group, textvariable=current_var, justify="left")
+    current_label.pack(anchor="w", pady=(0, 8))
+    autowrap(current_label, result_group, px(2 * 12 + 8))
 
     def chosen_run():
         return known.get(selected[0]) or next(iter(known.values()), None)
@@ -902,12 +1224,10 @@ def main(smoke_test: bool = False):
     button_row = ttk.Frame(result_group)
     button_row.pack(fill="x")
     premiere_btn = ttk.Button(button_row, text="📋  Copy Skeleton Path & Open Premiere", command=run_premiere, padding=(10, 5))
-    premiere_btn.pack(side="left", padx=(0, 8))
-    ttk.Button(button_row, text="Open project folder", command=open_project, padding=(10, 5)).pack(side="left", padx=(0, 8))
+    open_btn = ttk.Button(button_row, text="Open project folder", command=open_project, padding=(10, 5))
     retry_btn = ttk.Button(button_row, text="⟳  Retry script & audio fetch", command=retry_run, padding=(10, 5))
-    retry_btn.pack(side="left", padx=(0, 8))
     delete_btn = ttk.Button(button_row, text="🗑  Delete run", command=delete_run, padding=(10, 5))
-    delete_btn.pack(side="left")
+    flow_layout(button_row, [premiere_btn, open_btn, retry_btn, delete_btn], gap=px(8))  # wraps onto more rows when narrow
 
     # ---------------- Update tab ----------------
     version_group = ttk.LabelFrame(update_tab, text=" Version ", padding=12)
@@ -921,7 +1241,9 @@ def main(smoke_test: bool = False):
     update_group.pack(fill="x", pady=(12, 0))
     update_status_var = tk.StringVar(value="Checking for updates…" if FROZEN else
                                       "Updates are only available in the packaged app.")
-    ttk.Label(update_group, textvariable=update_status_var, foreground=MUTED).pack(anchor="w", pady=(0, 8))
+    update_status_label = ttk.Label(update_group, textvariable=update_status_var, foreground=MUTED, justify="left")
+    update_status_label.pack(anchor="w", pady=(0, 8))
+    autowrap(update_status_label, update_group, px(2 * 12 + 8))
     update_buttons_row = ttk.Frame(update_group)
     update_buttons_row.pack(anchor="w")
     update_btn = ttk.Button(update_buttons_row, text="⬆  Update Now", state="disabled")
@@ -929,7 +1251,9 @@ def main(smoke_test: bool = False):
     cancel_update_btn = ttk.Button(update_buttons_row, text="Cancel", state="disabled")
     cancel_update_btn.pack(side="left", padx=(8, 0))
     update_progress_var = tk.StringVar(value="")
-    ttk.Label(update_group, textvariable=update_progress_var, foreground=MUTED).pack(anchor="w", pady=(6, 0))
+    update_progress_label = ttk.Label(update_group, textvariable=update_progress_var, foreground=MUTED, justify="left")
+    update_progress_label.pack(anchor="w", pady=(6, 0))
+    autowrap(update_progress_label, update_group, px(2 * 12 + 8))
 
     update_info = [{}]
     updating = [False]
@@ -1065,9 +1389,9 @@ def main(smoke_test: bool = False):
     tree.heading("#0", text="Project")
     tree.heading("status", text="Status")
     tree.heading("date", text="Created")
-    tree.column("#0", width=380)
-    tree.column("status", width=200)
-    tree.column("date", width=140)
+    tree.column("#0", width=px(260), minwidth=px(140))  # modest widths: the columns stretch to fill, but never force the tab wider
+    tree.column("status", width=px(150), minwidth=px(90))
+    tree.column("date", width=px(130), minwidth=px(90))
     tree.pack(fill="x", pady=(0, 8))
     ttk.Label(runs_tab, text="Log", foreground=MUTED).pack(anchor="w")
     log_box = tk.Text(runs_tab, height=12, wrap="word", font=("Consolas" if os.name == "nt" else "Menlo", 9), state="disabled",
