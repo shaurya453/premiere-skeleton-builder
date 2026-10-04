@@ -124,6 +124,15 @@ def probe(path):
                 "has_audio": any(s.type == "audio" for s in container.streams)}
 
 
+def js_runtimes_option(node_path):
+    """yt-dlp's `js_runtimes` option for the Node.js we ship (used to solve YouTube's signature challenge).
+
+    The API takes a dict of {runtime: {config}}; the "runtime:path" string form belongs to the command
+    line only. An earlier version passed the string, which current yt-dlp rejects outright
+    ("Invalid js_runtimes format"), so every download that wasn't already cached failed."""
+    return {"node": {"path": str(node_path)}}
+
+
 def download_source(video_id, cache, ranges, handles=600, full=None, full_limit=5400, url=None):
     """Inspect duration first; download only a section for sources above the limit.
 
@@ -148,10 +157,7 @@ def download_source(video_id, cache, ranges, handles=600, full=None, full_limit=
         "ffmpeg_location": ffmpeg_exe(),
     }
     if node:
-        # yt-dlp's js_runtimes option takes a "runtime[:path]" string (e.g. "node:/path/to/node"),
-        # not a dict - a dict is silently ignored, which is why every download was printing
-        # "No supported JavaScript runtime could be found" despite node being bundled/available.
-        options["js_runtimes"] = f"node:{node}"
+        options["js_runtimes"] = js_runtimes_option(node)
     url = url or f"https://www.youtube.com/watch?v={video_id}"
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(url, download=False)
