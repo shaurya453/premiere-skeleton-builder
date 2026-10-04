@@ -116,7 +116,7 @@ class GoogleDocsTests(unittest.TestCase):
         self.assertNotIn("tab=", requested_urls[0])
 
     def test_sanitize_filename(self):
-        self.assertEqual(_sanitize_filename("Script: Part 1/2?"), "Script_ Part 1_2_.docx")
+        self.assertEqual(_sanitize_filename("Script: Part 1/2?"), "Script- Part 1-2.docx")
         self.assertEqual(_sanitize_filename("my_script.docx"), "my_script.docx")
 
     def test_extract_filename_from_headers(self):

@@ -8,11 +8,13 @@ import traceback
 from drive_audio import download_drive_audio, is_drive_url
 from paths import FROZEN, NO_WINDOW, cache_dir
 from jobs import ROOT, read_json, write_json, run_layout
+from safe_names import clean_filename
 
 
 def stage(source, directory):
     """Copy an input into the run's own folder so the run is self-contained."""
-    source, target = Path(source), Path(directory)/Path(source).name
+    source = Path(source)
+    target = Path(directory)/clean_filename(source.name)
     if source.resolve() != target.resolve():
         shutil.copy2(source, target)
     return target

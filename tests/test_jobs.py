@@ -127,9 +127,9 @@ class JobTests(unittest.TestCase):
     def test_run_folders_are_named_from_the_title_with_a_common_layout(self):
         with tempfile.TemporaryDirectory() as t:
             root=Path(t)
-            (root/'My_ Script_').mkdir()
+            (root/'My- Script').mkdir()
             folder=jobs.unique_folder(root,'My: Script?')
-            self.assertEqual(folder.name,'My_ Script_ (2)')
+            self.assertEqual(folder.name,'My- Script (2)')
             layout=jobs.run_layout(folder)
             self.assertEqual(sorted(layout),['audio','media','script','timeline'])
             self.assertEqual(layout['media'],folder/'Media')

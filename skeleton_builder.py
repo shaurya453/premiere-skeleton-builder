@@ -27,6 +27,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from google_docs import is_google_doc_url, download_google_doc
 from paths import NO_WINDOW, cache_dir, ffmpeg_exe, local_cache_dir, temp_dir
+from safe_names import restricted_characters
 
 NS = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main",
       "a": "http://schemas.openxmlformats.org/drawingml/2006/main",
@@ -1272,6 +1273,11 @@ def build(docx, audio, out, words=None, width=1920, height=1080,
     print("Extracting bookmarked images and narration cues...", flush=True)
     layout = {}
     script, cues, embedded, warnings = read_docx(docx, media_dir / "Images", cases=cases, layout=layout)
+    # The app cleans the names it creates, but the Projects and Media locations are the user's own.
+    risky = restricted_characters(media_dir) + restricted_characters(audio_dir)
+    if risky:
+        warnings.append(f"The folder path contains {' '.join(sorted(set(risky)))}; Premiere may refuse to open the "
+                        f"XML. Move the project or media folder to a path without those characters: {media_dir}")
     narration, method, timing_warnings = timed_tokens(words, audio)
     warnings.extend(timing_warnings)
     import av

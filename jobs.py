@@ -10,6 +10,7 @@ import time
 import uuid
 
 from paths import FROZEN, NO_WINDOW, ROOT, cache_dir, default_data_root
+from safe_names import clean_name
 
 SETTINGS = cache_dir() / 'desktop-settings.json'
 
@@ -171,8 +172,7 @@ def runs(root=None):
 
 
 def safe_name(title, limit=80):
-    cleaned = ''.join('_' if c in '<>:"/|?*' + chr(92) or ord(c) < 32 else c for c in str(title)).strip(' .')
-    return cleaned[:limit].strip(' .') or 'Untitled script'
+    return clean_name(title, limit=limit, fallback='Untitled script')
 
 
 def unique_folder(root, title):

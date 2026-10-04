@@ -10,6 +10,7 @@ import urllib.request
 import zipfile
 
 from network_retry import with_retries
+from safe_names import clean_filename
 
 DOC_ID_REGEX = re.compile(r"(?:/document/(?:u/\d+/)?d/|^)([a-zA-Z0-9_-]{25,})")
 # A Google Doc with multiple tabs puts the open tab's id in the URL, e.g. "?tab=t.0" or
@@ -55,10 +56,8 @@ def missing_tab_warning(url_or_id: str) -> str | None:
 
 def _sanitize_filename(name: str) -> str:
     """Sanitize a filename for Windows, macOS, and Linux."""
-    cleaned = re.sub(r'[<>:"/\\|?*]', '_', name).strip()
-    if not cleaned.lower().endswith(".docx"):
-        cleaned += ".docx"
-    return cleaned or "Google_Doc_Script.docx"
+    stem = name[:-5] if name.lower().endswith(".docx") else name
+    return clean_filename(stem + ".docx", fallback="Google_Doc_Script")
 
 
 def _extract_filename_from_headers(headers, fallback: str) -> str:

@@ -8,6 +8,7 @@ import urllib.parse
 import urllib.request
 
 from network_retry import with_retries
+from safe_names import clean_filename
 
 DRIVE_ID = re.compile(r"(?:/file/(?:u/\d+/)?d/|[?&]id=)([A-Za-z0-9_-]{20,})")
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -34,8 +35,7 @@ def _header_filename(headers, fallback: str) -> str:
 
 
 def _safe_name(name: str, fallback: str) -> str:
-    cleaned = re.sub(r'[<>:"/\\|?*]', "_", name or "").strip().rstrip(".")
-    return cleaned or fallback
+    return clean_filename(name, fallback=fallback)
 
 
 def download_drive_file(url: str, destination_dir: str | Path, label: str = "file", default_ext: str = ".bin",
