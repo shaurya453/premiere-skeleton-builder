@@ -85,6 +85,36 @@ def _write_version_file():
     return version_file
 
 
+def _write_windows_version_info(commit):
+    """The exe's Properties > Details tab (company, product, description, version). An exe with
+    none of it looks anonymous to antivirus heuristics, which is part of why unsigned PyInstaller
+    builds get flagged. The fourth number is the run number CI gives each build, or 0 locally.
+    Written beside VERSION.txt for the same reason: --clean wipes HERE/"build"."""
+    from PyInstaller.utils.win32.versioninfo import (FixedFileInfo, StringFileInfo, StringStruct,
+                                                      StringTable, VarFileInfo, VarStruct, VSVersionInfo)
+    build = int(os.environ.get("GITHUB_RUN_NUMBER") or 0)
+    numbers = (1, 0, 0, build)
+    dotted = ".".join(str(n) for n in numbers)
+    info = VSVersionInfo(
+        ffi=FixedFileInfo(filevers=numbers, prodvers=numbers, mask=0x3f, flags=0x0, OS=0x40004,
+                          fileType=0x1, subtype=0x0, date=(0, 0)),
+        kids=[StringFileInfo([StringTable("040904B0", [
+                  StringStruct("CompanyName", "Skeleton Builder"),
+                  StringStruct("FileDescription", "Premiere Pro Skeleton Builder"),
+                  StringStruct("FileVersion", dotted),
+                  StringStruct("InternalName", "SkeletonBuilder"),
+                  StringStruct("OriginalFilename", "SkeletonBuilder.exe"),
+                  StringStruct("ProductName", "Premiere Pro Skeleton Builder"),
+                  StringStruct("ProductVersion", f"{dotted} ({commit[:7]})"),
+              ])]),
+              VarFileInfo([VarStruct("Translation", [0x409, 1200])])])
+    version_dir = HERE / "build_version"
+    version_dir.mkdir(parents=True, exist_ok=True)
+    version_info = version_dir / "windows_version_info.txt"
+    version_info.write_text(str(info))
+    return version_info
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--node", help="path to a Node.js executable to bundle")
@@ -94,7 +124,7 @@ def main():
     options = [
         str(HERE / "skeleton_app.py"),
         "--name", "Premiere Skeleton Builder" if mac else "SkeletonBuilder",
-        "--noconfirm", "--clean", "--windowed", "--onedir",
+        "--noconfirm", "--clean", "--windowed", "--onedir", "--noupx",
         "--distpath", str(HERE / "dist"), "--workpath", str(HERE / "build"), "--specpath", str(HERE / "build"),
         "--paths", str(HERE),
         "--add-data", f"{version_file}{os.pathsep}.",
@@ -115,7 +145,8 @@ def main():
         if not tcl_dir or not tk_dir:
             raise SystemExit(f"Could not find Tcl/Tk under {Path(sys.base_prefix) / 'tcl'} - "
                               "the packaged app would launch without a usable Tk.")
-        options += ["--add-data", f"{tcl_dir}{os.pathsep}_tcl_data",
+        options += ["--version-file", str(_write_windows_version_info(version_file.read_text())),
+                    "--add-data", f"{tcl_dir}{os.pathsep}_tcl_data",
                     "--add-data", f"{tk_dir}{os.pathsep}_tk_data"]
     if args.node:
         options += ["--add-binary", f"{args.node}{os.pathsep}tools"]

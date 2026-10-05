@@ -33,7 +33,27 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller==6.22.3
+          pip install -r requirements.txt pyinstaller==6.22.3 pyinstaller-hooks-contrib==2026.8
+      - name: Compile PyInstaller's bootloader from source (Windows)
+        # The bootloader is the stub every PyInstaller exe starts with, and the prebuilt copy that
+        # ships on PyPI is the same file in thousands of programs, so antivirus engines have learned
+        # to distrust it (the "Trojan:Win32/Bearfoos.A!ml" / "Static AI - Suspicious PE" family of
+        # false positives). Building it on this runner gives our exe a stub nobody has fingerprinted.
+        # The sdist ships a prebuilt Windows bootloader too, so PYINSTALLER_COMPILE_BOOTLOADER is
+        # what forces the compile; the step fails if the file did not actually change.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PYINSTALLER_COMPILE_BOOTLOADER: "1"
+        run: |
+          $loader = python -c "import PyInstaller, pathlib; print(pathlib.Path(PyInstaller.__file__).parent / 'bootloader' / 'Windows-64bit-intel' / 'runw.exe')"
+          $before = (Get-FileHash $loader -Algorithm SHA256).Hash
+          pip install --force-reinstall --no-deps --no-binary pyinstaller pyinstaller==6.22.3
+          if ($LASTEXITCODE -ne 0) { throw "Compiling the PyInstaller bootloader failed" }
+          $after = (Get-FileHash $loader -Algorithm SHA256).Hash
+          Write-Host "prebuilt bootloader:  $before"
+          Write-Host "compiled bootloader:  $after"
+          if ($before -eq $after) { throw "The bootloader is still the prebuilt one" }
       - name: Run tests
         run: python -m unittest discover tests
       - name: Build app
@@ -43,6 +63,22 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: Compress-Archive -Path dist/SkeletonBuilder -DestinationPath "SkeletonBuilder-${{ matrix.name }}.zip"
+      - name: Scan the Windows build with Defender (informational only)
+        # Shows in the log whether Microsoft Defender flags this build before it is published.
+        # Never blocks the release: the runner's cloud protection can differ from a user's PC.
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          Start-MpScan -ScanType CustomScan -ScanPath "$PWD\dist\SkeletonBuilder"
+          $found = Get-MpThreatDetection
+          if ($found) {
+            $found | Format-List ThreatID, Resources
+            Get-MpThreat | Format-List ThreatName, SeverityID
+            Write-Warning "Defender flagged this build"
+          } else {
+            Write-Host "Defender found nothing in dist/SkeletonBuilder"
+          }
       - name: Package (macOS)
         if: runner.os == 'macOS'
         # PyInstaller's --windowed onedir build produces both the .app bundle and a plain
