@@ -19,8 +19,12 @@ jobs:
         include:
           - os: windows-latest
             name: Windows
-          - os: macos-14        # Apple Silicon; runs on Intel Macs too via Rosetta 2
+          - os: macos-14        # Apple Silicon only (arm64); this build does not run on Intel Macs
             name: macOS
+          - os: macos-15-intel  # Intel (x86_64) Macs; GitHub is retiring Intel runners in 2027
+            name: macOS-Intel
+            # onnxruntime stopped publishing Intel Mac wheels after 1.23.2 (macOS 13+).
+            pins: "onnxruntime==1.23.2"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +37,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyinstaller==6.22.3 pyinstaller-hooks-contrib==2026.8
+          pip install -r requirements.txt pyinstaller==6.22.3 pyinstaller-hooks-contrib==2026.8 ${{ matrix.pins }}
       - name: Compile PyInstaller's bootloader from source (Windows)
         # The bootloader is the stub every PyInstaller exe starts with, and the prebuilt copy that
         # ships on PyPI is the same file in thousands of programs, so antivirus engines have learned
@@ -109,4 +113,7 @@ jobs:
             gh release create latest --repo "$GITHUB_REPOSITORY" --title "Latest build" \
               --notes "commit:${{ github.sha }}" --target "${{ github.sha }}" || true
           gh release edit latest --repo "$GITHUB_REPOSITORY" --notes "commit:${{ github.sha }}" --target "${{ github.sha }}"
-          gh release upload latest --repo "$GITHUB_REPOSITORY" "SkeletonBuilder-${{ matrix.name }}.zip" --clobber
+          # The "#label" part names the commit this particular zip was built from. The release notes
+          # above are shared by every platform's job, so if one platform's build fails they would
+          # name a commit its zip doesn't have; the app reads this label first.
+          gh release upload latest --repo "$GITHUB_REPOSITORY" "SkeletonBuilder-${{ matrix.name }}.zip#SkeletonBuilder-${{ matrix.name }}.zip (commit:${{ github.sha }})" --clobber

@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -33,7 +35,16 @@ from paths import BUNDLE, FROZEN, NO_WINDOW, ROOT, app_dir, cache_dir
 
 REPO = "shaurya453/premiere-skeleton-builder"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{REPO}/releases/latest"
-ASSET_NAME = "SkeletonBuilder-Windows.zip" if os.name == "nt" else "SkeletonBuilder-macOS.zip"
+
+
+def asset_name_for(system_is_windows, machine):
+    """The release asset for this computer: Windows, an Intel Mac, or (otherwise) an Apple Silicon Mac."""
+    if system_is_windows:
+        return "SkeletonBuilder-Windows.zip"
+    return "SkeletonBuilder-macOS-Intel.zip" if machine == "x86_64" else "SkeletonBuilder-macOS.zip"
+
+
+ASSET_NAME = asset_name_for(os.name == "nt", platform.machine())
 UPDATE_LOG = cache_dir() / "update.log"
 _USER_AGENT = {"User-Agent": "SkeletonBuilderUpdater"}
 
@@ -79,15 +90,22 @@ def latest_release(timeout=15):
         raise ValueError(f"GitHub returned HTTP {error.code} checking for updates") from error
     except urllib.error.URLError as error:
         raise ValueError(f"Network error checking for updates: {error.reason}") from error
-    commit = None
-    for line in (data.get("body") or "").splitlines():
-        if line.strip().startswith("commit:"):
-            commit = line.split(":", 1)[1].strip()
-    if not commit:
-        raise ValueError("Latest release has no recorded commit")
     asset = next((a for a in data.get("assets", []) if a.get("name") == ASSET_NAME), None)
     if not asset:
         raise ValueError(f"Latest release has no {ASSET_NAME} asset")
+    # Each build labels its own zip "<name> (commit:<sha>)" when it uploads it, so that label says
+    # exactly which commit this zip was built from. The release notes carry one shared "commit:"
+    # line that whichever platform finishes first overwrites - if another platform's build failed,
+    # it would claim a version this platform's zip doesn't have. The notes are the fallback for
+    # releases published before the labels existed.
+    labelled = re.search(r"commit:([0-9a-f]{7,40})", asset.get("label") or "")
+    commit = labelled.group(1) if labelled else None
+    if not commit:
+        for line in (data.get("body") or "").splitlines():
+            if line.strip().startswith("commit:"):
+                commit = line.split(":", 1)[1].strip()
+    if not commit:
+        raise ValueError("Latest release has no recorded commit")
     return {"commit": commit, "asset_url": asset["browser_download_url"], "size": asset.get("size", 0)}
 
 

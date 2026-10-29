@@ -75,8 +75,10 @@ Download the zip for your computer from the GitHub **Actions** tab (workflow "Bu
   with no Open option at all, that's a stale build from before this app started ad-hoc signing the
   bundle - re-download the latest build, or run
   `xattr -cr "/Applications/Premiere Skeleton Builder.app"` in Terminal, which fixes it either way.
-  One build covers both Apple Silicon and Intel Macs; on an Intel Mac it runs under Rosetta 2
-  (macOS installs this automatically the first time it's needed).
+  There are two Mac zips: `SkeletonBuilder-macOS` for Apple Silicon Macs (M1 and later) and
+  `SkeletonBuilder-macOS-Intel` for Intel Macs (macOS 13 or newer). Pick the one for your Mac
+  (Apple menu > About This Mac shows the chip). The Apple Silicon build does not run on an Intel
+  Mac: Rosetta 2 only translates Intel apps for Apple Silicon, not the other way round.
   Actually drag the `.app` into `/Applications` with Finder before opening it — launching it
   straight from the unzipped Downloads folder can trigger macOS "App Translocation", which runs
   it from a randomized read-only path and can throw a "read only" error on first launch. The

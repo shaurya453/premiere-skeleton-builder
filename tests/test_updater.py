@@ -18,17 +18,42 @@ class VersionCheckTests(unittest.TestCase):
         mock_resp.__exit__.return_value = False
         return mock_resp
 
+    def test_asset_name_picks_the_zip_for_this_computer(self):
+        self.assertEqual(updater.asset_name_for(True, "AMD64"), "SkeletonBuilder-Windows.zip")
+        self.assertEqual(updater.asset_name_for(False, "arm64"), "SkeletonBuilder-macOS.zip")
+        self.assertEqual(updater.asset_name_for(False, "x86_64"), "SkeletonBuilder-macOS-Intel.zip")
+
     def test_latest_release_parses_commit_and_matching_asset(self):
         release = {"body": "Automated build\ncommit:abc1234def5678\n",
                    "assets": [{"name": "SkeletonBuilder-Windows.zip", "browser_download_url": "https://x/win.zip", "size": 100},
-                              {"name": "SkeletonBuilder-macOS.zip", "browser_download_url": "https://x/mac.zip", "size": 200}]}
-        with patch("urllib.request.urlopen", return_value=self._response(release)):
-            info = updater.latest_release()
-        self.assertEqual(info["commit"], "abc1234def5678")
-        self.assertEqual(info["asset_url"], f"https://x/{'win' if os.name == 'nt' else 'mac'}.zip")
+                              {"name": "SkeletonBuilder-macOS.zip", "browser_download_url": "https://x/mac.zip", "size": 200},
+                              {"name": "SkeletonBuilder-macOS-Intel.zip", "browser_download_url": "https://x/intel.zip", "size": 300}]}
+        for name, url in (("SkeletonBuilder-Windows.zip", "win"), ("SkeletonBuilder-macOS.zip", "mac"),
+                          ("SkeletonBuilder-macOS-Intel.zip", "intel")):
+            with patch.object(updater, "ASSET_NAME", name), \
+                 patch("urllib.request.urlopen", return_value=self._response(release)):
+                info = updater.latest_release()
+            self.assertEqual(info["commit"], "abc1234def5678")
+            self.assertEqual(info["asset_url"], f"https://x/{url}.zip")
+
+    def test_each_zip_reports_the_commit_in_its_own_label(self):
+        # One platform's build failed, so its zip is still from the older commit while the shared
+        # release notes already name the newer one: the label is what tells the truth.
+        sha_old, sha_new = "a" * 40, "b" * 40
+        release = {"body": f"commit:{sha_new}",
+                   "assets": [{"name": "SkeletonBuilder-macOS.zip", "browser_download_url": "https://x/mac.zip",
+                               "label": f"SkeletonBuilder-macOS.zip (commit:{sha_old})"},
+                              {"name": "SkeletonBuilder-Windows.zip", "browser_download_url": "https://x/win.zip",
+                               "label": f"SkeletonBuilder-Windows.zip (commit:{sha_new})"}]}
+        for name, expected in (("SkeletonBuilder-macOS.zip", sha_old), ("SkeletonBuilder-Windows.zip", sha_new)):
+            with patch.object(updater, "ASSET_NAME", name), \
+                 patch("urllib.request.urlopen", return_value=self._response(release)):
+                self.assertEqual(updater.latest_release()["commit"], expected)
 
     def test_latest_release_rejects_missing_commit_or_asset(self):
-        with patch("urllib.request.urlopen", return_value=self._response({"body": "no commit line here", "assets": []})):
+        no_commit = {"body": "no commit line here",
+                     "assets": [{"name": updater.ASSET_NAME, "browser_download_url": "https://x/a.zip"}]}
+        with patch("urllib.request.urlopen", return_value=self._response(no_commit)):
             with self.assertRaisesRegex(ValueError, "commit"):
                 updater.latest_release()
         with patch("urllib.request.urlopen", return_value=self._response({"body": "commit:abc123", "assets": []})):
