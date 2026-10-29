@@ -1,4 +1,5 @@
 """Mouse-wheel maths and the nested scrolling pages used by the desktop UI (app.py)."""
+import gc
 import sys
 import unittest
 from pathlib import Path
@@ -56,6 +57,12 @@ class ScrollableTests(unittest.TestCase):
 
     def tearDown(self):
         self.root.destroy()
+        # Tk widgets and variables are released by Python's garbage collector, and Tcl aborts the
+        # whole process ("Tcl_AsyncDelete: async handler deleted by the wrong thread") if that
+        # happens on a thread other than the one that created the interpreter. Later tests run
+        # downloads on worker threads, so collect here, on this thread, while it is still safe.
+        self.page = self.inner_list = self.rows = self.root = None
+        gc.collect()
 
     def wheel(self, widget, delta):
         """The wheel over `widget`, without depending on where the OS says the pointer is."""
